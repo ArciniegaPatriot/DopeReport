@@ -206,11 +206,11 @@ writeln("- Total Shrinkage – N/A")
 writeln("- Discretionary Shrinkage – N/A")
 writeln("- Non-Discretionary Shrinkage – N/A")
 
-writeln("### 6. Abandoned %rec (all in & by split)")
-writeln(f"- **Total Abandoned %rec:** **{total_abandonment_rate_str}**")
+writeln("### 6. Abandoned (all in & by split)")
+writeln(f"- **Total Abandoned:** **{total_abandonment_rate_str}**")
 for sk in skills_wanted:
     mask = by_skill["SKILL"].astype(str).str.lower() == sk.lower()
-    val = by_skill.loc[mask, "Abandoned %rec"]
+    val = by_skill.loc[mask, "Abandoned"]
     writeln(f"- **SKILL: {sk}:** {val.iloc[0] if len(val) else 'Not found in this report'}")
 writeln("")
 
