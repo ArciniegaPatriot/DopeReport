@@ -1,0 +1,21 @@
+{
+  "company_name": "Your Company",
+  "skill_col": "SKILL",
+  "calls_col": "CALLS",
+  "agents_col": "AGENT distinct count",
+  "aht_col": "Average HANDLE TIME",
+  "abandoned_count_col": "ABANDONED count",
+  "abandoned_rate_col": "ABANDONED (%rec)",
+  "skills": [
+    "B2B Member Success",
+    "B2B Success Activation",
+    "B2B Success Info",
+    "B2B Success Tech Support",
+    "Fortress",
+    "MS Activation",
+    "MS Info",
+    "MS Loyalty",
+    "MS Tech Support",
+    "PM Connect"
+  ]
+}
