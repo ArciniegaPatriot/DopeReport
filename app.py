@@ -179,13 +179,13 @@ else:
 by_skill["AHT"] = df[aht_col].astype(str)
 by_skill.rename(columns={skill_col: "SKILL"}, inplace=True)
 
-# Total abandonment
+# Total Abandoned %rec
 if aband_num is not None and calls_num.fillna(0).sum() > 0:
-    total_abandonment_rate_str = f"{(aband_num.fillna(0).sum() / calls_num.fillna(0).sum())*100:.2f}%"
-elif abandoned_rate_col != "<none>" and abandoned_rate_col in df.columns:
+    total_abandoned_%rec_str = f"{(aband_num.fillna(0).sum() / calls_num.fillna(0).sum())*100:.2f}%"
+elif abandoned_%rec_col != "<none>" and abandoned_%rec_col in df.columns:
     total_abandonment_rate_str = "N/A (needs counts)"
 else:
-    total_abandonment_rate_str = "N/A"
+    total_abandoned_%rec_str = "N/A"
 
 # ---- Build the filled report (Markdown) ----
 md = io.StringIO()
@@ -194,7 +194,7 @@ def writeln(s=""):
 
 title = "Autofilled Metrics"
 if company_name:
-    title = f"{company_name} — " + title
+    title = f"{Patriot Mobile} — " + title
 
 writeln(f"## {title}\n")
 writeln(f"### 3. Total Calls\n**{total_calls}**\n")
@@ -206,11 +206,11 @@ writeln("- Total Shrinkage – N/A")
 writeln("- Discretionary Shrinkage – N/A")
 writeln("- Non-Discretionary Shrinkage – N/A\n")
 
-writeln("### 6. Abandonment Rate (all in & by split)")
-writeln(f"- **Total Abandonment Rate:** **{total_abandonment_rate_str}**")
+writeln("### 6. Abandoned %rec (all in & by split)")
+writeln(f"- **Total Abandoned %rec:** **{total_abandonment_rate_str}**")
 for sk in skills_wanted:
     mask = by_skill["SKILL"].astype(str).str.lower() == sk.lower()
-    val = by_skill.loc[mask, "Abandonment Rate"]
+    val = by_skill.loc[mask, "Abandoned %rec"]
     writeln(f"- **SKILL: {sk}:** {val.iloc[0] if len(val) else 'Not found in this report'}")
 writeln("")
 
