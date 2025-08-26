@@ -194,7 +194,7 @@ def writeln(s=""):
 
 title = "Autofilled Metrics"
 if company_name:
-    title = f"{Patriot Mobile} — " + title
+    title = f"{Patriot_Mobile} — " + title
 
 writeln(f"## {title}\n")
 writeln(f"### 3. Total Calls\n**{total_calls}**\n")
@@ -204,7 +204,7 @@ writeln("*Not available unless shrinkage columns are present in your file.*")
 writeln("- Daily Shrinkage – N/A")
 writeln("- Total Shrinkage – N/A")
 writeln("- Discretionary Shrinkage – N/A")
-writeln("- Non-Discretionary Shrinkage – N/A\n")
+writeln("- Non-Discretionary Shrinkage – N/A")
 
 writeln("### 6. Abandoned %rec (all in & by split)")
 writeln(f"- **Total Abandoned %rec:** **{total_abandonment_rate_str}**")
