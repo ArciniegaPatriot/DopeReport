@@ -1,5 +1,14 @@
 # app.py
+# Streamlit app: Autofill KPIs from an uploaded CSV/XLSX/XLS
+# Core fields only: SKILL, CALLS, Agents Staffed, ABANDONED count, AHT
+# - Robust file reading (openpyxl for .xlsx, xlrd for .xls)
+# - Config load/save (JSON)
+# - Copy & Paste helpers + Word/PDF exports (graceful if deps missing)
+# - Fortress -> PM Connect aliasing
+# - IMPROVED AUTO-DETECT: broad synonyms + normalized matching
+
 import io
+import re
 import json
 import pandas as pd
 import streamlit as st
@@ -20,15 +29,14 @@ try:
 except Exception:
     HAS_PDF = False
 
-st.set_page_config(page_title="Autofill Numbers", layout="wide")
+st.set_page_config(page_title="Autofill Numbers (Core)", layout="wide")
 
-st.title("🧮 Autofill Numbers from Report")
-st.caption("Upload a CSV or Excel report, map columns once (or load a config), and auto-fill your metrics.")
+st.title("🧮 Autofill Numbers — Core Fields")
+st.caption("Upload a CSV or Excel report, map columns once (or load a config), and get only: Skills, Calls, Agents Staffed, Abandoned (count), and AHT. Now with smarter auto-detect of column names.")
 
 # ---- Sidebar: Config load/save & Branding ----
 st.sidebar.header("Config")
 cfg_file = st.sidebar.file_uploader("Load config (JSON)", type=["json"], key="cfg")
-
 company_name = st.sidebar.text_input("Company name (optional)", value="")
 
 loaded_cfg = {}
@@ -41,13 +49,46 @@ if cfg_file is not None:
     except Exception as e:
         st.sidebar.error(f"Invalid config: {e}")
 
+# Optional: load a sample config committed in your repo at config/sample_report_config.json
+if st.sidebar.button("Load sample config from repo", use_container_width=True):
+    try:
+        with open("config/sample_report_config.json", "r") as f:
+            loaded_cfg = json.load(f)
+        st.sidebar.success("Loaded sample config from repo.")
+        if not company_name and "company_name" in loaded_cfg:
+            company_name = loaded_cfg["company_name"]
+    except Exception as e:
+        st.sidebar.error(f"Couldn't load sample config: {e}")
+
 # ---- Helpers ----
-def find_col(df, candidates):
-    cols_lower = {c.strip().lower(): c for c in df.columns}
-    for cand in candidates:
-        key = cand.strip().lower()
-        if key in cols_lower:
-            return cols_lower[key]
+def norm(s: str) -> str:
+    """Normalize strings: lowercase, collapse to alnum only (remove spaces/punct)."""
+    return re.sub(r"[^a-z0-9]+", "", str(s).lower())
+
+def find_col(df: pd.DataFrame, synonyms) -> str | None:
+    """
+    Try to find a column by a list of synonyms.
+    Matching strategy:
+      1) exact match on normalized name
+      2) contains match on normalized name
+    Returns original column name or None.
+    """
+    cols = list(df.columns)
+    norm_map = {norm(c): c for c in cols}
+    syn_norm = [norm(x) for x in synonyms if str(x).strip()]
+
+    # 1) exact normalized match
+    for s in syn_norm:
+        if s in norm_map:
+            return norm_map[s]
+
+    # 2) contains (prefer earliest df column)
+    for c in cols:
+        nc = norm(c)
+        for s in syn_norm:
+            if s and (s in nc or nc in s):
+                return c
+
     return None
 
 def idx_or_default(options, value):
@@ -91,41 +132,60 @@ if df.empty:
     st.warning("The uploaded file appears to be empty.")
     st.stop()
 
-st.subheader("Preview")
-st.dataframe(df.head(20))
+st.subheader("Preview (first 20 rows)")
+preview_df = df.head(20).copy()
+st.dataframe(preview_df, use_container_width=True)
 
 # ---- Column Mapping ----
 st.subheader("Column Mapping")
 
-# Auto-guesses
-skill_guess = find_col(df, ["SKILL", "Group", "Queue", "Split"])
-calls_guess = find_col(df, ["CALLS", "Total Calls", "Calls"])
-agents_guess = find_col(df, ["AGENT distinct count", "Agents", "Agents Staffed", "Agent Count"])
-aband_count_guess = find_col(df, ["ABANDONED count", "Abandoned Count"])
-aband_rate_guess = find_col(df, ["ABANDONED (%rec)", "Abandon Rate", "Abandonment Rate"])
-aht_guess = find_col(df, ["Average HANDLE TIME", "AHT", "Avg Handle Time"])
+# Expanded synonym sets (feel free to suggest more)
+SKILL_SYNS = [
+    "skill", "skill name", "skill group", "group", "queue", "split",
+    "team", "program", "department", "dept", "category", "line of business", "lob"
+]
+CALLS_SYNS = [
+    "calls", "total calls", "calls offered", "offered", "inbound calls", "in calls",
+    "total contacts", "contacts", "total interactions", "volume"
+]
+AGENTS_SYNS = [
+    "agents staffed", "agents", "agent count", "staffed agents",
+    "distinct agents", "distinct agent count", "unique agents",
+    "logged in agents", "logged-in agents", "logged in", "agents (distinct)", "agents (unique)"
+]
+ABAND_SYNS = [
+    "abandoned count", "abandoned", "abandon count", "aband count", "aband",
+    "abandoned calls", "abandoned_calls", "aband qty", "abandqty", "aband num", "aband total"
+]
+AHT_SYNS = [
+    "average handle time", "aht", "avg handle time", "avg handling time",
+    "avg handle", "average handling time", "aht (s)", "aht (sec)", "avg talk+hold+acw", "talk+hold+acw", "handle time"
+]
+
+# Auto-guesses using synonym matcher
+skill_guess  = find_col(df, SKILL_SYNS)
+calls_guess  = find_col(df, CALLS_SYNS)
+agents_guess = find_col(df, AGENTS_SYNS)
+aband_guess  = find_col(df, ABAND_SYNS)
+aht_guess    = find_col(df, AHT_SYNS)
 
 cols = list(df.columns)
 def cfg_get(key, default):
     return loaded_cfg.get(key, default) if loaded_cfg else default
 
-skill_col = st.selectbox("Skill / Group column", cols, index=idx_or_default(cols, cfg_get("skill_col", skill_guess or cols[0])))
-calls_col = st.selectbox("Calls column", cols, index=idx_or_default(cols, cfg_get("calls_col", calls_guess or cols[0])))
-agents_col = st.selectbox("Agents staffed column", cols, index=idx_or_default(cols, cfg_get("agents_col", agents_guess or cols[0])))
-aht_col = st.selectbox("AHT column", cols, index=idx_or_default(cols, cfg_get("aht_col", aht_guess or cols[0])))
+skill_col  = st.selectbox("Skill / Group column", cols, index=idx_or_default(cols, cfg_get("skill_col",  skill_guess  or cols[0])))
+calls_col  = st.selectbox("Calls column",        cols, index=idx_or_default(cols, cfg_get("calls_col",  calls_guess  or cols[0])))
+agents_col = st.selectbox("Agents Staffed column", cols, index=idx_or_default(cols, cfg_get("agents_col", agents_guess or cols[0])))
+aband_col  = st.selectbox("Abandoned (count) column",    cols, index=idx_or_default(cols, cfg_get("abandoned_count_col", aband_guess  or cols[0])))
+aht_col    = st.selectbox("Average Handle Time (AHT) column", cols, index=idx_or_default(cols, cfg_get("aht_col",    aht_guess    or cols[0])))
 
-abandoned_count_col = st.selectbox("Abandoned count column (optional)", ["<none>"] + cols,
-                                   index=idx_or_default(["<none>"]+cols, cfg_get("abandoned_count_col", aband_count_guess if aband_count_guess else "<none>")))
-abandoned_rate_col = st.selectbox("Abandoned % column (optional)", ["<none>"] + cols,
-                                  index=idx_or_default(["<none>"]+cols, cfg_get("abandoned_rate_col", aband_rate_guess if aband_rate_guess else "<none>")))
-
-# ---- Skills of interest (customizable list) ----
+# ---- Skills of interest (optional list for sectioned output) ----
+# NOTE: "Fortress" will be aliased to "PM Connect"
 default_skills = [
     "B2B Member Success",
     "B2B Success Activation",
     "B2B Success Info",
     "B2B Success Tech Support",
-    "Fortress",
     "MS Activation",
     "MS Info",
     "MS Loyalty",
@@ -133,7 +193,15 @@ default_skills = [
     "PM Connect",
 ]
 skills_list = st.text_area("Skills of interest (one per line)", value="\n".join(cfg_get("skills", default_skills)))
-skills_wanted = [s.strip() for s in skills_list.splitlines() if s.strip()]
+
+# Parse user skills, alias "Fortress" -> "PM Connect" and de-duplicate (preserve order)
+raw_skills = [s.strip() for s in skills_list.splitlines() if s.strip()]
+skills_wanted = []
+for s in raw_skills:
+    if s.lower() == "fortress":
+        s = "PM Connect"
+    if s not in skills_wanted:
+        skills_wanted.append(s)
 
 # ---- Save current config ----
 cfg = {
@@ -141,107 +209,129 @@ cfg = {
     "skill_col": skill_col,
     "calls_col": calls_col,
     "agents_col": agents_col,
+    "abandoned_count_col": aband_col,
     "aht_col": aht_col,
-    "abandoned_count_col": abandoned_count_col,
-    "abandoned_rate_col": abandoned_rate_col,
     "skills": skills_wanted,
 }
 st.download_button("⬇️ Download current config (JSON)", data=json.dumps(cfg, indent=2).encode("utf-8"),
                    file_name="autofill_config.json", mime="application/json")
 
 # ---- Defensive: verify required columns exist ----
-missing = [c for c in [skill_col, calls_col, agents_col, aht_col] if c not in df.columns]
+missing = [c for c in [skill_col, calls_col, agents_col, aband_col, aht_col] if c not in df.columns]
 if missing:
     st.error(f"Selected columns not found in file: {missing}")
     st.stop()
 
-# ---- Calculations ----
-calls_num = pd.to_numeric(df[calls_col], errors="coerce")
-agents_num = pd.to_numeric(df[agents_col], errors="coerce")
-aband_num = pd.to_numeric(df[abandoned_count_col], errors="coerce") if (abandoned_count_col != "<none>" and abandoned_count_col in df.columns) else None
+# ---- Normalize & alias skills in the DATAFRAME ----
+df[skill_col] = df[skill_col].astype(str).str.strip()
+df.loc[df[skill_col].str.lower() == "fortress", skill_col] = "PM Connect"
 
-total_calls = int(calls_num.fillna(0).sum())
-total_agents = int(agents_num.fillna(0).sum())
+# ---- Calculations (core only) ----
+calls_num  = pd.to_numeric(df[calls_col],  errors="coerce").fillna(0)
+agents_num = pd.to_numeric(df[agents_col], errors="coerce").fillna(0)
+aband_num  = pd.to_numeric(df[aband_col],  errors="coerce").fillna(0)
 
-# Per-skill abandon rate
-by_skill = df[[skill_col]].copy()
-if abandoned_rate_col != "<none>" and abandoned_rate_col in df.columns:
-    by_skill["Abandonment Rate"] = df[abandoned_rate_col].astype(str)
-else:
-    if aband_num is not None and calls_num is not None:
-        with pd.option_context('mode.use_inf_as_na', True):
-            rate = (aband_num / calls_num) * 100
-        by_skill["Abandonment Rate"] = rate.round(2).astype(str) + "%"
-    else:
-        by_skill["Abandonment Rate"] = "N/A"
+total_calls   = int(calls_num.sum())
+total_agents  = int(agents_num.sum())     # NOTE: sum across rows (source may not be globally de-duplicated)
+total_abandon = int(aband_num.sum())
 
-# AHT by skill
-by_skill["AHT"] = df[aht_col].astype(str)
-by_skill.rename(columns={skill_col: "SKILL"}, inplace=True)
+# By-skill table with ONLY core fields (rename to "Agents Staffed")
+by_skill_core = pd.DataFrame({
+    "SKILL": df[skill_col].astype(str),
+    "CALLS": calls_num.astype("Int64"),
+    "Agents Staffed": agents_num.astype("Int64"),
+    "ABANDONED count": aband_num.astype("Int64"),
+    "AHT": df[aht_col].astype(str),
+})
 
-# Total Abandoned %rec
-if aband_num is not None and calls_num.fillna(0).sum() > 0:
-    total_abandoned_str = f"{(aband_num.fillna(0).sum() / calls_num.fillna(0).sum())*100:.2f}%"
-elif abandoned_col != "<none>" and abandoned_col in df.columns:
-    total_abandoned_str = "N/A (needs counts)"
-else:
-    total_abandoned_str = "N/A"
-
-# ---- Build the filled report (Markdown) ----
+# ---- Build the filled report (Markdown) — core stats only ----
 md = io.StringIO()
 def writeln(s=""):
     md.write(s + "\n")
 
-title = "Autofilled Metrics"
-if company_name:
-    title = f"{Patriot_Mobile} — " + title
-
+title = (company_name + " — " if company_name else "") + "Autofilled Metrics (Core)"
 writeln(f"## {title}\n")
-writeln(f"### 3. Total Calls\n**{total_calls}**\n")
-writeln(f"### 4. Total Agents Staffed\n**{total_agents}**\n")
-writeln("### 5. Shrinkage")
-writeln("*Not available unless shrinkage columns are present in your file.*")
-writeln("- Daily Shrinkage – N/A")
-writeln("- Total Shrinkage – N/A")
-writeln("- Discretionary Shrinkage – N/A")
-writeln("- Non-Discretionary Shrinkage – N/A")
 
-writeln("### 6. Abandoned (all in & by split)")
-writeln(f"- **Total Abandoned:** **{total_abandoned_str}**")
-for sk in skills_wanted:
-    mask = by_skill["SKILL"].astype(str).str.lower() == sk.lower()
-    val = by_skill.loc[mask, "Abandoned"]
-    writeln(f"- **SKILL: {sk}:** {val.iloc[0] if len(val) else 'Not found in this report'}")
-writeln("")
+writeln(f"### 3. Total Calls\n**{total_calls}**\n")
+writeln(f"### 4. Agents Staffed (sum of per-skill)\n**{total_agents}**\n")
+writeln(f"### 6. Abandoned (count)\n**{total_abandon}**\n")
 
 writeln("### 7. AHT (By Group)")
 for sk in skills_wanted:
-    mask = by_skill["SKILL"].astype(str).str.lower() == sk.lower()
-    val = by_skill.loc[mask, "AHT"]
+    mask = by_skill_core["SKILL"].astype(str).str.lower() == sk.lower()
+    val = by_skill_core.loc[mask, "AHT"]
     writeln(f"- **{sk}:** {val.iloc[0] if len(val) else 'Not found in this report'}")
 
 report_md = md.getvalue()
 
-st.subheader("Filled Report")
+# ==============================
+# UI SECTIONS
+# ==============================
+
+st.subheader("Filled Report (Core)")
 st.markdown(report_md)
 
-# Download markdown
+# ---- Copy & Paste helpers ----
+st.subheader("Copy & Paste")
+
+tabs = st.tabs([
+    "📋 Report (Markdown)",
+    "📋 KPIs (CSV)",
+    "📋 By-Skill Core Table (CSV)",
+    "📋 By-Skill Core Table (TSV)",
+    "📋 Preview (first 20 rows CSV)"
+])
+
+with tabs[0]:
+    st.write("Use the copy icon in the code block to copy the entire Markdown report:")
+    st.code(report_md, language="markdown")
+
+with tabs[1]:
+    kpi_df = pd.DataFrame([{
+        "Total Calls": total_calls,
+        "Agents Staffed (sum of per-skill)": total_agents,
+        "Total Abandoned (count)": total_abandon
+    }])
+    st.dataframe(kpi_df, use_container_width=True)
+    st.write("Copy the CSV below:")
+    st.code(kpi_df.to_csv(index=False), language="text")
+
+with tabs[2]:
+    csv_text = by_skill_core.to_csv(index=False)
+    st.dataframe(by_skill_core, use_container_width=True)
+    st.write("Copy the CSV below:")
+    st.code(csv_text, language="text")
+
+with tabs[3]:
+    tsv_text = by_skill_core.to_csv(index=False, sep="\t")
+    st.dataframe(by_skill_core, use_container_width=True)
+    st.write("Copy the TSV below:")
+    st.code(tsv_text, language="text")
+
+with tabs[4]:
+    prev_csv = preview_df.to_csv(index=False)
+    st.dataframe(preview_df, use_container_width=True)
+    st.write("Copy the CSV below:")
+    st.code(prev_csv, language="text")
+
+# ---- Downloads for the Markdown report ----
+st.subheader("Downloads")
 st.download_button(
     label="⬇️ Download report (Markdown)",
     data=report_md.encode("utf-8"),
-    file_name="filled_report.md",
+    file_name="filled_report_core.md",
     mime="text/markdown",
 )
 
-# Show by-skill table for visibility
-st.subheader("By-Skill Table")
-st.dataframe(by_skill)
+# Show by-skill table (visual)
+st.subheader("By-Skill Table — Core Fields")
+st.dataframe(by_skill_core, use_container_width=True)
 
 # ---- Word export (if available) ----
 if HAS_DOCX:
     def build_docx(md_text, company=""):
         doc = Document()
-        doc.add_heading(company + (" — " if company else "") + "Autofilled Metrics", level=1)
+        doc.add_heading(company + (" — " if company else "") + "Autofilled Metrics (Core)", level=1)
         for line in md_text.splitlines():
             if line.startswith("### "):
                 doc.add_heading(line.replace("### ", ""), level=2)
@@ -259,7 +349,7 @@ if HAS_DOCX:
     st.download_button(
         label="⬇️ Download report (Word .docx)",
         data=docx_bytes,
-        file_name="filled_report.docx",
+        file_name="filled_report_core.docx",
         mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
     )
 else:
@@ -268,19 +358,15 @@ else:
 # ---- PDF export (if available) ----
 if HAS_PDF:
     def build_pdf(md_text, company=""):
-        from reportlab.lib.pagesizes import letter
-        from reportlab.pdfgen import canvas
-        from reportlab.lib.units import inch
         bio = io.BytesIO()
         c = canvas.Canvas(bio, pagesize=letter)
         width, height = letter
         left_margin = 0.75 * inch
-        right_margin = 0.75 * inch
         top_margin = 0.75 * inch
         bottom_margin = 0.75 * inch
 
         y = height - top_margin
-        title = company + (" — " if company else "") + "Autofilled Metrics"
+        title = company + (" — " if company else "") + "Autofilled Metrics (Core)"
         c.setFont("Times-Bold", 14)
         c.drawString(left_margin, y, title)
         y -= 0.3*inch
@@ -310,7 +396,7 @@ if HAS_PDF:
     st.download_button(
         label="⬇️ Download report (PDF)",
         data=pdf_bytes,
-        file_name="filled_report.pdf",
+        file_name="filled_report_core.pdf",
         mime="application/pdf",
     )
 else:
