@@ -181,11 +181,11 @@ by_skill.rename(columns={skill_col: "SKILL"}, inplace=True)
 
 # Total Abandoned %rec
 if aband_num is not None and calls_num.fillna(0).sum() > 0:
-    total_abandoned_%rec_str = f"{(aband_num.fillna(0).sum() / calls_num.fillna(0).sum())*100:.2f}%"
-elif abandoned_%rec_col != "<none>" and abandoned_%rec_col in df.columns:
-    total_abandonment_rate_str = "N/A (needs counts)"
+    total_abandoned_str = f"{(aband_num.fillna(0).sum() / calls_num.fillna(0).sum())*100:.2f}%"
+elif abandoned_col != "<none>" and abandoned_col in df.columns:
+    total_abandoned_str = "N/A (needs counts)"
 else:
-    total_abandoned_%rec_str = "N/A"
+    total_abandoned_str = "N/A"
 
 # ---- Build the filled report (Markdown) ----
 md = io.StringIO()
