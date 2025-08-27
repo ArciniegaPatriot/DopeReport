@@ -1,5 +1,9 @@
-# app.py — KPI app with auto-refresh + trends + multi-skill compare
-# Robust against: older Streamlit (no st.rerun), missing Altair, optional exports
+# app.py — KPI app (no login) with auto-refresh + trends + multi-skill compare
+# Data sources: Manual | Public CSV URL | Local folder (latest *.csv)
+# Outputs: Skills, Calls, Agents Staffed, AHT, Abandon %, per-skill sections, downloads
+# Trends: Daily / Weekly / Monthly (weighted by Calls), single-skill & multi-skill compare
+# Hardened for: duplicate widget IDs, older Streamlit (no st.rerun), optional Altair fallback
+
 import os, io, re, glob, time
 from datetime import date
 import numpy as np
@@ -24,16 +28,20 @@ def find_col(df: pd.DataFrame, synonyms) -> str | None:
     norm_map = {norm(c): c for c in cols}
     syn_norm = [norm(x) for x in synonyms if str(x).strip()]
     for s in syn_norm:
-        if s in norm_map: return norm_map[s]
+        if s in norm_map:
+            return norm_map[s]
     for c in cols:
         nc = norm(c)
         for s in syn_norm:
-            if s and (s in nc or nc in s): return c
+            if s and (s in nc or nc in s):
+                return c
     return None
 
 def idx_or_default(options, value):
-    try: return options.index(value) if value in options else 0
-    except Exception: return 0
+    try:
+        return options.index(value) if value in options else 0
+    except Exception:
+        return 0
 
 def read_any(uploaded_or_bytes, name_hint: str | None = None):
     # Bytes → try CSV then Excel
@@ -49,9 +57,9 @@ def read_any(uploaded_or_bytes, name_hint: str | None = None):
         if name.endswith(".csv"):  return pd.read_csv(uploaded_or_bytes)
         if name.endswith(".xlsx"): return pd.read_excel(uploaded_or_bytes, engine="openpyxl")
         if name.endswith(".xls"):  return pd.read_excel(uploaded_or_bytes, engine="xlrd")
-        # Fallback: try CSV, then Excel
+        # Fallback: try CSV then Excel
         try:    return pd.read_csv(uploaded_or_bytes)
-        except: 
+        except:
             if hasattr(uploaded_or_bytes, "seek"): uploaded_or_bytes.seek(0)
             return pd.read_excel(uploaded_or_bytes)
     except Exception as e:
@@ -130,6 +138,7 @@ def aggregate_by_period_all_skills(df_time: pd.DataFrame,
                                    rate_pct_series: pd.Series | None,
                                    aband_count_col: str | None,
                                    period_col: str) -> pd.DataFrame:
+    """Weighted aggregation per (Skill, Period)."""
     tmp = df_time.copy()
     tmp["Calls_num"] = pd.to_numeric(tmp[calls_col], errors="coerce").fillna(0.0)
     tmp["AHT_sec"]   = pd.to_numeric(tmp[aht_sec_col], errors="coerce")
@@ -195,15 +204,18 @@ if auto_refresh:
     if now - last >= refresh_secs:
         st.session_state["_last_refresh_ts"] = now
         (getattr(st, "rerun", None) or st.experimental_rerun)()
-if st.sidebar.button("🔄 Reload now"):
+if st.sidebar.button("🔄 Reload now", key="manual_reload_btn"):
     st.session_state["_last_refresh_ts"] = time.time()
     (getattr(st, "rerun", None) or st.experimental_rerun)()
 
-# Data source
+# Data source (UNIQUE KEYS to avoid duplicate ID error)
 st.sidebar.header("Main Report — Data Source")
-source_type = st.sidebar.radio("Choose source",
-                               ["Manual upload", "Public CSV URL", "Local folder (latest *.csv)"],
-                               index=0)
+source_type = st.sidebar.radio(
+    "Choose source",
+    ["Manual upload", "Public CSV URL", "Local folder (latest *.csv)"],
+    index=0,
+    key="main_source_radio"           # 👈 unique key
+)
 main_url    = st.sidebar.text_input("Main CSV URL", os.getenv("MAIN_CSV_URL", ""))
 main_folder = st.sidebar.text_input("Main local folder", "./data")
 main_glob   = st.sidebar.text_input("Main filename pattern", "*.csv")
@@ -218,7 +230,7 @@ try:
         df, source_meta = load_latest_local_csv(main_folder, main_glob)
         if df is None: st.error(f"Local load failed: {source_meta.get('error','')}"); st.stop()
     else:
-        uploaded = st.file_uploader("Main report (CSV/XLSX/XLS)", type=["csv", "xlsx", "xls"], key="main")
+        uploaded = st.file_uploader("Main report (CSV/XLSX/XLS)", type=["csv", "xlsx", "xls"], key="main_uploader")
         if uploaded is None:
             st.info("Upload the main CSV/Excel file, or choose another source.")
             st.stop()
@@ -279,11 +291,14 @@ for s in raw_skills:
     if s.lower() == "fortress": s = "PM Connect"
     if s not in skills_wanted: skills_wanted.append(s)
 
-# Secondary (Agents total) — optional
+# Secondary (Agents total) — optional (UNIQUE KEY for radio)
 st.sidebar.header("Second Report (Agents total) — Data Source")
-second_source_type = st.sidebar.radio("Choose source",
-                                      ["Manual upload", "Public CSV URL", "Local folder (latest *.csv)"],
-                                      index=0)
+second_source_type = st.sidebar.radio(
+    "Choose source",
+    ["Manual upload", "Public CSV URL", "Local folder (latest *.csv)"],
+    index=0,
+    key="second_source_radio"         # 👈 unique key
+)
 second_df, second_meta = None, {}
 try:
     if second_source_type == "Public CSV URL":
@@ -295,7 +310,7 @@ try:
         second_df, second_meta = load_latest_local_csv(fold2, pat2)
     else:
         uploaded2 = st.file_uploader("Second report (CSV/XLSX/XLS) — overall totals / no skill filter (optional)",
-                                     type=["csv", "xlsx", "xls"], key="second")
+                                     type=["csv", "xlsx", "xls"], key="second_uploader")
         if uploaded2 is not None:
             second_df = read_any(uploaded2)
 except Exception as e:
@@ -331,9 +346,8 @@ total_calls = int(calls_num.sum())
 total_agents = int(agents_num.sum())
 agents_label = "Agents Staffed (sum of per-skill)"
 if second_df is not None and not second_df.empty:
-    # autodetect agents column in 2nd report
-    AGENTS_SYNS = ["agents staffed", "agents", "agent count", "distinct", "unique"]
-    agents2_guess = find_col(second_df, AGENTS_SYNS) or next((c for c in second_df.columns if "agent" in c.lower()), None)
+    AGENTS_SYNS_MINI = ["agents staffed", "agents", "agent count", "distinct", "unique"]
+    agents2_guess = find_col(second_df, AGENTS_SYNS_MINI) or next((c for c in second_df.columns if "agent" in c.lower()), None)
     if agents2_guess:
         agents2_num = pd.to_numeric(second_df[agents2_guess], errors="coerce").fillna(0)
         total_agents = int(agents2_num.sum()); agents_label = "Agents Staffed (from 2nd report)"
