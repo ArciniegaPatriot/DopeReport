@@ -1,13 +1,13 @@
-# app.py — Minimal "Metrics Report" shell with Patriot-inspired colors + logo
-# - Title color: Patriot Red (#C8102E)
-# - Header bar: Navy (#0B2D52)
+# app.py — Minimal "Metrics Report" shell (Patriot-inspired colors + logo)
+# - Title is white
+# - Header bar uses Patriot Mobile navy
 # - Upload a logo OR use a logo URL (upload wins)
 # - Paste your report UI where indicated
 
 import base64
 import streamlit as st
 
-# Optional: only needed if you'll use a logo URL
+# Optional: only needed if you’ll use a logo URL
 try:
     import requests
     HAS_REQUESTS = True
@@ -28,7 +28,9 @@ with st.sidebar:
     logo_file = st.file_uploader(
         "Upload logo (.svg/.png/.jpg)", type=["svg", "png", "jpg", "jpeg"], key="logo_upload"
     )
-    logo_url = st.text_input("…or paste a logo URL", placeholder="https://example.com/logo.svg", key="logo_url")
+    logo_url = st.text_input(
+        "…or paste a logo URL", placeholder="https://example.com/logo.svg", key="logo_url"
+    )
     st.caption("Tip: SVG preferred. If both are provided, the upload is used.")
 
 # ---------------- Helpers ----------------
@@ -47,7 +49,7 @@ def _fetch_logo_bytes():
     if logo_file is not None:
         data = logo_file.read()
         return data, (_guess_ext(data) or "svg")
-    # Else URL
+    # Else try URL
     if logo_url.strip():
         if not HAS_REQUESTS:
             st.sidebar.warning("Add 'requests' to requirements.txt to use a logo URL.")
@@ -114,7 +116,7 @@ html, body, .stApp {{
 }}
 .pm-title {{
   margin: 0; padding: 0;
-  color: {PM_RED}; /* Title in Patriot Red */
+  color: {PM_WHITE}; /* Title in white */
   font: 700 22px/1.2 Poppins, Inter, system-ui, -apple-system, Segoe UI, Roboto, Arial;
 }}
 
@@ -158,4 +160,4 @@ c2.metric("Agents Staffed", "—")
 c3.metric("Abandon %", "—")
 
 st.markdown("---")
-st.caption("Page chrome uses Patriot Mobile-inspired colors (red/navy/white). Replace with official values if you have a brand guide.")
+st.caption("Page chrome uses Patriot-inspired colors (navy/white with red accents). Replace with official values if you have a brand guide.")
