@@ -4,3 +4,9 @@ python-docx==1.1.2
 reportlab==4.2.2
 openpyxl==3.1.5
 xlrd==2.0.1
+requests==2.32.3
+zeep==4.2.1
+paramiko==3.4.0
+streamlit-authenticator==0.3.2
+PyYAML==6.0.1
+bcrypt==4.1.3
