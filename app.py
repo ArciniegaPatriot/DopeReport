@@ -1,53 +1,59 @@
-# app.py — Minimal page chrome with Patriot Mobile-inspired colors + logo
-# - Page title: "Metrics Report"
-# - Simple color styling (red/navy/white), no heavy theme
-# - Logo from upload OR URL (upload wins)
-# - Drop your existing report UI where indicated
+# app.py — Minimal "Metrics Report" shell with Patriot-inspired colors + logo
+# - Title color: Patriot Red (#C8102E)
+# - Header bar: Navy (#0B2D52)
+# - Upload a logo OR use a logo URL (upload wins)
+# - Paste your report UI where indicated
 
-import io
 import base64
-from urllib.parse import urlparse
 import streamlit as st
 
-# Optional: only needed if you use a logo URL
+# Optional: only needed if you'll use a logo URL
 try:
     import requests
     HAS_REQUESTS = True
 except Exception:
     HAS_REQUESTS = False
 
+# ---------------- Brand Colors ----------------
+PM_RED   = "#C8102E"
+PM_NAVY  = "#0B2D52"
+PM_WHITE = "#FFFFFF"
+PM_GRAY  = "#D7DBE2"
+
 st.set_page_config(page_title="Metrics Report", layout="wide")
 
-# ---- Brand colors (inspired by Patriot Mobile) ----
-PM_RED  = "#C8102E"
-PM_NAVY = "#0B2D52"
-PM_WHITE = "#FFFFFF"
-PM_GRAY = "#D7DBE2"
-
-# ---- Sidebar controls for logo ----
+# ---------------- Sidebar: Logo ----------------
 with st.sidebar:
     st.header("Brand & Logo")
-    logo_file = st.file_uploader("Upload logo (.svg/.png/.jpg)", type=["svg", "png", "jpg", "jpeg"])
-    logo_url = st.text_input("…or paste a logo URL", placeholder="https://example.com/logo.svg")
-    st.caption("Tip: SVG preferred. If both provided, the upload is used.")
+    logo_file = st.file_uploader(
+        "Upload logo (.svg/.png/.jpg)", type=["svg", "png", "jpg", "jpeg"], key="logo_upload"
+    )
+    logo_url = st.text_input("…or paste a logo URL", placeholder="https://example.com/logo.svg", key="logo_url")
+    st.caption("Tip: SVG preferred. If both are provided, the upload is used.")
 
+# ---------------- Helpers ----------------
 def _guess_ext(b: bytes) -> str:
-    if b[:4] == b"\x89PNG": return "png"
-    if b[:3] == b"\xFF\xD8\xFF": return "jpg"
+    if b[:4] == b"\x89PNG":
+        return "png"
+    if b[:3] == b"\xFF\xD8\xFF":
+        return "jpg"
     head = b[:200].lstrip()
-    if head.startswith(b"<svg") or head.startswith(b"<?xml"): return "svg"
+    if head.startswith(b"<svg") or head.startswith(b"<?xml"):
+        return "svg"
     return "bin"
 
 def _fetch_logo_bytes():
+    # Upload wins
     if logo_file is not None:
         data = logo_file.read()
         return data, (_guess_ext(data) or "svg")
+    # Else URL
     if logo_url.strip():
         if not HAS_REQUESTS:
             st.sidebar.warning("Add 'requests' to requirements.txt to use a logo URL.")
             return None, None
         try:
-            r = requests.get(logo_url, timeout=20)
+            r = requests.get(logo_url.strip(), timeout=20)
             r.raise_for_status()
             data = r.content
             return data, _guess_ext(data)
@@ -56,9 +62,19 @@ def _fetch_logo_bytes():
             return None, None
     return None, None
 
-logo_bytes, logo_ext = _fetch_logo_bytes()
+def _to_data_uri(b: bytes, ext: str) -> str:
+    if ext == "svg":
+        # Prefer UTF-8 text form for crisp rendering
+        try:
+            txt = b.decode("utf-8", errors="ignore")
+            return f"data:image/svg+xml;utf8,{txt}"
+        except Exception:
+            pass
+    mime = "image/svg+xml" if ext == "svg" else ("image/png" if ext == "png" else "image/jpeg")
+    return f"data:{mime};base64,{base64.b64encode(b).decode('ascii')}"
 
-# Fallback placeholder SVG (simple wordmark box) if no logo provided
+# Fetch / fallback logo
+logo_bytes, logo_ext = _fetch_logo_bytes()
 if logo_bytes is None:
     placeholder_svg = f'''<svg xmlns="http://www.w3.org/2000/svg" width="220" height="40" viewBox="0 0 440 80">
   <rect width="440" height="80" rx="12" fill="{PM_NAVY}"/>
@@ -70,25 +86,14 @@ if logo_bytes is None:
     logo_bytes = placeholder_svg.encode("utf-8")
     logo_ext = "svg"
 
-def _to_data_uri(b: bytes, ext: str) -> str:
-    # Prefer text form for SVG
-    if ext == "svg":
-        try:
-            txt = b.decode("utf-8", errors="ignore")
-            return f"data:image/svg+xml;utf8,{txt}"
-        except Exception:
-            pass
-    mime = "image/svg+xml" if ext == "svg" else ("image/png" if ext == "png" else "image/jpeg")
-    b64 = base64.b64encode(b).decode("ascii")
-    return f"data:{mime};base64,{b64}"
-
 logo_data_uri = _to_data_uri(logo_bytes, logo_ext or "svg")
 
-# ---- Light CSS to color the page (no full theme) ----
-st.markdown(f"""
+# ---------------- Light CSS (balanced & safe) ----------------
+st.markdown(
+    f"""
 <style>
-/* Page background + default text */
-html, body, .main, .stApp {{
+/* App background */
+html, body, .stApp {{
   background: #ffffff;
   color: #0B1020;
 }}
@@ -96,7 +101,7 @@ html, body, .main, .stApp {{
 /* Top header bar */
 .pm-header {{
   position: sticky; top: 0; z-index: 10;
-  background: linear-gradient(90deg, {PM_NAVY}, {PM_NAVY});
+  background: {PM_NAVY};
   border-bottom: 1px solid {PM_GRAY};
   padding: 10px 0;
 }}
@@ -105,71 +110,52 @@ html, body, .main, .stApp {{
   display: flex; align-items: center; gap: 16px;
 }}
 .pm-logo {{
-  height: 36px; width: auto; display:block;
+  height: 36px; width: auto; display: block;
 }}
 .pm-title {{
-  margin: 0; padding: 0; color: {PM_WHITE};
+  margin: 0; padding: 0;
+  color: {PM_RED}; /* Title in Patriot Red */
   font: 700 22px/1.2 Poppins, Inter, system-ui, -apple-system, Segoe UI, Roboto, Arial;
 }}
-/* Accent underline for section titles */
-h2, .stMarkdown h2 {{
-  border-bottom: 2px solid {PM_RED}; padding-bottom: 4px;
+
+/* Optional accents */
+h2 {{
+  border-bottom: 2px solid {PM_RED};
+  padding-bottom: 4px;
 }}
-/* Buttons */
 .stButton > button {{
   background: {PM_RED}; color: {PM_WHITE}; border: 1px solid transparent;
   border-radius: 10px; padding: 0.5rem 0.9rem; font-weight: 600;
 }}
-.stButton > button:hover {{
-  filter: brightness(0.95);
-}}
-/* Checkboxes, radios focus rings */
-input:focus-visible, select:focus-visible, textarea:focus-visible {{
-  outline: 3px solid {PM_RED}33 !important;
-}}
-/* Tables border tone */
-[data-testid="stTable"] table, .stDataFrame div[role="grid"] {{
-  border-color: {PM_GRAY} !important;
-}}
+.stButton > button:hover {{ filter: brightness(0.95); }}
 </style>
-""", unsafe_allow_html=True)
-
-# ---- Header bar with logo + title ----
-st.markdown(f"""
-<style>
-/* ...other styles... */
-
-.pm-title {{
-  margin: 0; padding: 0;
-  color: {PM_RED};  /* was {PM_WHITE} */
-  font: 700 22px/1.2 Poppins, Inter, system-ui, -apple-system, Segoe UI, Roboto, Arial;
-}}
-
-/* ...other styles... */
-</style>
-""", unsafe_allow_html=True)
-
+    """,
+    unsafe_allow_html=True,
 )
 
-# ---- Page body (put your report below) ----
-st.write("")  # small spacer
+# ---------------- Header with Logo + Title ----------------
+st.markdown(
+    f"""
+<div class="pm-header">
+  <div class="pm-wrap">
+    <img src="{logo_data_uri}" alt="Logo" class="pm-logo" />
+    <h1 class="pm-title">Metrics Report</h1>
+  </div>
+</div>
+""",
+    unsafe_allow_html=True,
+)
 
-# Example “hero” title line (kept very minimal)
+# ---------------- Your Report Area ----------------
+st.write("")  # small spacer
 st.markdown("#### Overview")
 
-# >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
-# Your report UI goes here.
-# For example, if you already have code that renders KPIs/tables/charts,
-# paste it below this line. The header above will keep the brand color/Logo.
-# >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
-
-# Small demo block (safe to delete)
-with st.container():
-    c1, c2, c3 = st.columns(3)
-    c1.metric("Total Calls", "12,480", "+3.2%")
-    c2.metric("Agents Staffed", "142", "+4")
-    c3.metric("Abandon %", "2.14%", "-0.3 pts")
-    st.caption("Replace these demo metrics with your real ones.")
+# >>> Paste your existing report UI below this line. <<<
+# Example placeholders (safe to delete):
+c1, c2, c3 = st.columns(3)
+c1.metric("Total Calls", "—")
+c2.metric("Agents Staffed", "—")
+c3.metric("Abandon %", "—")
 
 st.markdown("---")
-st.caption("Brand colors are inspired by Patriot Mobile (red/navy/white). Replace with official values if you have a brand guide.")
+st.caption("Page chrome uses Patriot Mobile-inspired colors (red/navy/white). Replace with official values if you have a brand guide.")
