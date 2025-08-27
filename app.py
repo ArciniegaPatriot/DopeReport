@@ -135,16 +135,20 @@ input:focus-visible, select:focus-visible, textarea:focus-visible {{
 """, unsafe_allow_html=True)
 
 # ---- Header bar with logo + title ----
-st.markdown(
-    f"""
-    <div class="pm-header">
-      <div class="pm-wrap">
-        <img src="{logo_data_uri}" alt="Logo" class="pm-logo" />
-        <h1 class="pm-title">Metrics Report</h1>
-      </div>
-    </div>
-    """,
-    unsafe_allow_html=True
+st.markdown(f"""
+<style>
+/* ...other styles... */
+
+.pm-title {{
+  margin: 0; padding: 0;
+  color: {PM_RED};  /* was {PM_WHITE} */
+  font: 700 22px/1.2 Poppins, Inter, system-ui, -apple-system, Segoe UI, Roboto, Arial;
+}}
+
+/* ...other styles... */
+</style>
+""", unsafe_allow_html=True)
+
 )
 
 # ---- Page body (put your report below) ----
