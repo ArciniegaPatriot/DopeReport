@@ -1,124 +1,19 @@
-# app.py — Protected KPI app with login + Five9/SFTP sources
-# -------------------------------------------------------------------
-# Auth: streamlit-authenticator (bcrypt hashes in secrets or auth.yaml)
-# Data sources: Manual | Public CSV URL | Local folder | SFTP (Five9 Scheduled) | Five9 SOAP
+# app.py — KPI app (no login) with auto-refresh + trends + multi-skill compare
+# Data sources: Manual | Public CSV URL | Local folder (latest *.csv)
 # Outputs: Skills, Calls, Agents Staffed, AHT, Abandon %, per-skill sections, downloads
+# Trends: Daily / Weekly / Monthly (weighted by Calls), single-skill & multi-skill compare
 
-import os
-import io
-import re
-import glob
-import time
-import json
-import datetime as dt
+import os, io, re, glob, time, json
+from datetime import date
+import numpy as np
 import pandas as pd
 import streamlit as st
+import altair as alt
 
-# ---------- Optional deps (graceful fallback) ----------
-try:
-    from docx import Document
-    HAS_DOCX = True
-except Exception:
-    HAS_DOCX = False
+# ---------- Page ----------
+st.set_page_config(page_title="Autofill Numbers", layout="wide")
 
-try:
-    from reportlab.lib.pagesizes import letter
-    from reportlab.pdfgen import canvas
-    from reportlab.lib.units import inch
-    HAS_PDF = True
-except Exception:
-    HAS_PDF = False
-
-try:
-    import requests
-    HAS_REQUESTS = True
-except Exception:
-    HAS_REQUESTS = False
-
-try:
-    from zeep import Client, Settings
-    from zeep.transports import Transport
-    HAS_ZEEP = True
-except Exception:
-    HAS_ZEEP = False
-
-try:
-    import paramiko
-    HAS_SFTP = True
-except Exception:
-    HAS_SFTP = False
-
-# ---------- AUTH BLOCK ----------
-import streamlit_authenticator as stauth
-try:
-    import yaml
-    from yaml.loader import SafeLoader
-    HAS_YAML = True
-except Exception:
-    HAS_YAML = False
-
-st.set_page_config(page_title="Autofill Numbers (Protected)", layout="wide")
-
-def _load_auth_cfg():
-    # Preferred: from .streamlit/secrets.toml
-    if "auth" in st.secrets:
-        return st.secrets["auth"]
-    # Fallback: auth.yaml in repo root
-    if HAS_YAML and os.path.exists("auth.yaml"):
-        with open("auth.yaml", "r") as f:
-            return yaml.load(f, Loader=SafeLoader)
-    raise RuntimeError("No auth config found. Add [auth] to secrets or provide auth.yaml.")
-
-def _allowed(username: str, email: str, cfg: dict) -> bool:
-    allow = cfg.get("allowlist", {}) or {}
-    allow_u = set(allow.get("usernames", []) or [])
-    allow_e = set(allow.get("emails", []) or [])
-    # If both are empty → all authenticated users allowed
-    if not allow_u and not allow_e:
-        return True
-    return (username in allow_u) or (email in allow_e)
-
-def require_login() -> bool:
-    try:
-        cfg = _load_auth_cfg()
-    except Exception as e:
-        st.error(str(e))
-        return False
-
-    cookie = cfg.get("cookie", {})
-    credentials = cfg.get("credentials", {})
-    preauth = cfg.get("preauthorized", {})  # optional key supported by the lib
-
-    authenticator = stauth.Authenticate(
-        credentials,
-        cookie.get("name", "auth_cookie"),
-        cookie.get("key", "please_change_me"),
-        cookie.get("expiry_days", 30),
-        preauth
-    )
-
-    st.markdown("<h2 style='margin-top:0'>🔐 Sign in</h2>", unsafe_allow_html=True)
-    name, auth_status, username = authenticator.login("main")
-
-    if auth_status:
-        user_rec = (credentials.get("usernames", {}) or {}).get(username, {})
-        email = user_rec.get("email", "")
-        if not _allowed(username, email, cfg):
-            st.error("You are authenticated but not authorized for this app.")
-            return False
-        authenticator.logout("Logout", "sidebar")
-        st.sidebar.success(f"Welcome, {name}")
-        if user_rec.get("role"):
-            st.sidebar.caption(f"Role: {user_rec['role']}")
-        return True
-    elif auth_status is False:
-        st.error("Username/password is incorrect")
-        return False
-    else:
-        st.info("Enter your credentials to continue.")
-        return False
-
-# ---------- Helpers (shared by the app) ----------
+# ---------- Helpers ----------
 def norm(s: str) -> str:
     return re.sub(r"[^a-z0-9]+", "", str(s).lower())
 
@@ -143,14 +38,12 @@ def idx_or_default(options, value):
         return 0
 
 def read_any(uploaded_or_bytes, name_hint: str | None = None):
-    # Bytes-like: try CSV then Excel
     if isinstance(uploaded_or_bytes, (bytes, bytearray)):
         bio = io.BytesIO(uploaded_or_bytes)
         try:
             bio.seek(0); return pd.read_csv(bio)
         except Exception:
             bio.seek(0); return pd.read_excel(bio)
-    # File-like / UploadedFile
     name = (getattr(uploaded_or_bytes, "name", None) or name_hint or "").lower()
     if name.endswith(".csv"):
         return pd.read_csv(uploaded_or_bytes)
@@ -168,13 +61,13 @@ def read_any(uploaded_or_bytes, name_hint: str | None = None):
 def to_percent(series_like):
     s = pd.Series(series_like).astype(str).str.replace('%', '', regex=False)
     vals = pd.to_numeric(s, errors='coerce')
-    if vals.dropna().max() is not None and vals.dropna().max() <= 1.0:
+    mx = vals.dropna().max() if not vals.dropna().empty else None
+    if mx is not None and mx <= 1.0:
         vals = vals * 100.0
     return vals
 
-def fetch_csv_url(url: str) -> tuple[pd.DataFrame | None, dict]:
-    if not HAS_REQUESTS:
-        return None, {"error": "requests not installed"}
+def try_fetch_csv_url(url: str) -> tuple[pd.DataFrame | None, dict]:
+    import requests
     if not url:
         return None, {"error": "No URL provided"}
     try:
@@ -197,408 +90,546 @@ def load_latest_local_csv(folder: str, pattern: str = "*.csv") -> tuple[pd.DataF
     except Exception as e:
         return None, {"error": str(e)}
 
-def load_latest_sftp_csv(host: str, port: int, username: str, password: str,
-                         remote_dir: str, pattern: str = "*.csv") -> tuple[pd.DataFrame | None, dict]:
-    if not HAS_SFTP:
-        return None, {"error": "paramiko not installed"}
-    try:
-        import posixpath
-        transport = paramiko.Transport((host, port))
-        transport.connect(username=username, password=password)
-        sftp = paramiko.SFTPClient.from_transport(transport)
+def parse_duration_to_seconds(x) -> float:
+    """Accepts 'HH:MM:SS' or 'MM:SS' or raw numbers (assumed seconds)."""
+    if pd.isna(x): return np.nan
+    s = str(x).strip()
+    if re.fullmatch(r"^-?\d+(\.\d+)?$", s):  # numeric
+        return float(s)
+    if ":" in s:
         try:
-            sftp.chdir(remote_dir)
-        except IOError:
-            sftp.close(); transport.close()
-            return None, {"error": f"Remote directory not found: {remote_dir}"}
-        # Simple fnmatch using regex
-        rx = re.compile("^" + pattern.replace(".", r"\.").replace("*", ".*") + "$")
-        files = [f for f in sftp.listdir_attr(".") if rx.match(f.filename)]
-        if not files:
-            sftp.close(); transport.close()
-            return None, {"error": f"No files matching {pattern} in {remote_dir}"}
-        latest = max(files, key=lambda f: f.st_mtime)
-        with sftp.file(latest.filename, "rb") as fh:
-            blob = fh.read()
-        sftp.close(); transport.close()
-        df = read_any(blob, name_hint=latest.filename)
-        return df, {"source": f"sftp://{host}{posixpath.join(remote_dir, latest.filename)}", "mtime": latest.st_mtime}
-    except Exception as e:
-        return None, {"error": str(e)}
+            parts = [float(p) for p in s.split(":")]
+            if len(parts) == 3:
+                h, m, s2 = parts; return h*3600 + m*60 + s2
+            if len(parts) == 2:
+                m, s2 = parts; return m*60 + s2
+        except Exception:
+            return np.nan
+    m = re.match(r"(\d+(\.\d+)?)", s)
+    return float(m.group(1)) if m else np.nan
 
-def _dt_to_five9(dt_obj: dt.datetime | dt.date) -> str:
-    if isinstance(dt_obj, dt.date) and not isinstance(dt_obj, dt.datetime):
-        dt_obj = dt.datetime(dt_obj.year, dt_obj.month, dt_obj.day, 0, 0, 0)
-    return dt_obj.strftime("%Y-%m-%d %H:%M:%S GMT")
+def format_seconds(secs: float) -> str:
+    if pd.isna(secs): return "N/A"
+    secs = float(secs)
+    h = int(secs // 3600); m = int((secs % 3600) // 60); s = int(secs % 60)
+    return f"{h:d}:{m:02d}:{s:02d}" if h > 0 else f"{m:d}:{s:02d}"
 
-def five9_run_report_to_df(wsdl_url: str, username: str, password: str,
-                           report_name: str, folder: str | None,
-                           date_from: dt.date, date_to: dt.date) -> tuple[pd.DataFrame, dict]:
-    if not (HAS_ZEEP and HAS_REQUESTS):
-        raise RuntimeError("Missing dependency: zeep and/or requests")
+def add_time_columns(df: pd.DataFrame, date_col: str) -> pd.DataFrame:
+    dts = pd.to_datetime(df[date_col], errors="coerce")
+    out = df.copy()
+    out["_DT"] = dts
+    out["_DATE"] = dts.dt.normalize()
+    out["_WEEK_START"] = dts.dt.to_period("W-MON").dt.start_time
+    out["_MONTH_START"] = dts.dt.to_period("M").dt.start_time
+    return out
 
-    session = requests.Session()
-    session.auth = (username, password)   # SOAP reporting uses Basic Auth
-    transport = Transport(session=session, timeout=120)
-    settings = Settings(strict=False, xml_huge_tree=True)
-    client = Client(wsdl=wsdl_url, transport=transport, settings=settings)
-    svc = client.service
+def aggregate_by_period_all_skills(df_time: pd.DataFrame,
+                                   skill_col: str,
+                                   calls_col: str,
+                                   aht_sec_col: str,
+                                   rate_pct_series: pd.Series | None,
+                                   aband_count_col: str | None,
+                                   period_col: str) -> pd.DataFrame:
+    """Weighted aggregation per (Skill, Period)."""
+    tmp = df_time.copy()
+    tmp["Calls_num"] = pd.to_numeric(tmp[calls_col], errors="coerce").fillna(0.0)
+    tmp["AHT_sec"] = pd.to_numeric(tmp[aht_sec_col], errors="coerce")
 
-    start_str = _dt_to_five9(dt.datetime.combine(date_from, dt.time.min))
-    end_str   = _dt_to_five9(dt.datetime.combine(date_to, dt.time.max).replace(microsecond=0))
+    if aband_count_col:
+        tmp["_AB_CNT"] = pd.to_numeric(tmp[aband_count_col], errors="coerce")
+    if rate_pct_series is not None:
+        tmp["_AB_RATE"] = pd.to_numeric(rate_pct_series, errors="coerce")  # 0..100
 
-    # Try two common signatures
-    try:
-        result_id = svc.runReport(reportName=report_name, folderName=(folder or None),
-                                  timeFrom=start_str, timeTo=end_str)
-    except Exception:
-        try:
-            req_type = None
-            try: req_type = client.get_type("ns0:reportRequest")
-            except Exception: pass
-            payload = {"reportName": report_name, "timeFrom": start_str, "timeTo": end_str}
-            if folder: payload["folderName"] = folder
-            req_obj = req_type(**payload) if req_type else payload
-            result_id = svc.runReport(req_obj)
-        except Exception as e2:
-            raise RuntimeError(f"runReport failed: {e2}")
+    g = tmp.groupby([skill_col, period_col], dropna=False)
+    calls_sum = g["Calls_num"].sum()
 
-    # Poll until complete
-    for _ in range(120):
-        if not svc.isReportRunning(result_id):
-            break
-        time.sleep(1.2)
+    # Weighted AHT
+    def _wa(group):
+        denom = group["Calls_num"].sum()
+        return np.nansum(group["AHT_sec"] * group["Calls_num"]) / denom if denom > 0 else np.nan
+    aht_w = g.apply(_wa)
+
+    # Abandon %
+    if aband_count_col:
+        ab_cnt = g["_AB_CNT"].sum()
+        ab_pct = (ab_cnt / calls_sum.replace(0, np.nan)) * 100.0
+    elif rate_pct_series is not None:
+        def _weighted_rate(group):
+            r = group["_AB_RATE"]
+            return np.nansum(r * group["Calls_num"]) / group["Calls_num"].sum() if group["Calls_num"].sum() > 0 else np.nan
+        ab_pct = g.apply(_weighted_rate)
     else:
-        raise RuntimeError("Report timed out waiting for completion.")
+        ab_pct = pd.Series(index=calls_sum.index, dtype=float)
 
-    # Fetch CSV
-    csv_blob = svc.getReportResultCsv(result_id)
-    raw = csv_blob if isinstance(csv_blob, (bytes, bytearray)) else str(csv_blob).encode("utf-8", "ignore")
-    try:
-        import csv
-        sample = raw[:4096].decode("utf-8", "ignore")
-        dialect = csv.Sniffer().sniff(sample)
-        df = pd.read_csv(io.BytesIO(raw), dialect=dialect)
-    except Exception:
-        df = pd.read_csv(io.BytesIO(raw))
-    meta = {"source": f"Five9 report '{report_name}'", "from": start_str, "to": end_str}
-    return df, meta
-
-# ---------- The main app (runs only after login) ----------
-def run_app():
-    st.title("🧮 Autofill Numbers — Core Fields")
-    st.caption("Protected app. Data sources: Manual, URL, Local folder, SFTP (Five9 scheduled), Five9 SOAP.")
-
-    # ---------------- Sidebar: Main report source ----------------
-    st.sidebar.header("Main Report — Data Source")
-    source_type = st.sidebar.radio(
-        "Choose source",
-        ["Manual upload", "Public CSV URL", "Local folder (latest *.csv)", "SFTP (Five9 Scheduled)", "Five9 API (SOAP)"],
-        index=0,
-    )
-
-    refresh_secs = st.sidebar.number_input("Auto-refresh seconds (manual reload)", 10, 3600, 60, 5)
-    if st.sidebar.button("🔄 Reload now"):
-        st.rerun()
-
-    # URL/Local inputs
-    main_url    = st.sidebar.text_input("Main CSV URL", os.getenv("MAIN_CSV_URL", ""))
-    main_folder = st.sidebar.text_input("Main local folder", "./data")
-    main_glob   = st.sidebar.text_input("Main filename pattern", "*.csv")
-
-    # SFTP inputs
-    with st.sidebar.expander("SFTP settings (Five9 Scheduled)", expanded=(source_type == "SFTP (Five9 Scheduled)")):
-        sftp_host = st.text_input("Host", os.getenv("SFTP_HOST", ""))
-        sftp_port = st.number_input("Port", 1, 65535, int(os.getenv("SFTP_PORT", "22") or 22))
-        sftp_user = st.text_input("Username", os.getenv("SFTP_USER", ""))
-        sftp_pass = st.text_input("Password", os.getenv("SFTP_PASS", ""), type="password")
-        sftp_dir  = st.text_input("Remote directory", os.getenv("SFTP_DIR", "/"))
-        sftp_pat  = st.text_input("Filename pattern", "*.csv")
-
-    # Five9 SOAP inputs
-    with st.sidebar.expander("Five9 (SOAP) settings", expanded=(source_type == "Five9 API (SOAP)")):
-        five9_wsdl   = st.text_input("Five9 WSDL URL", os.getenv("FIVE9_WSDL", "https://api.five9.com/wsadmin/v12/AdminWebService?wsdl"))
-        five9_user   = st.text_input("Five9 username", os.getenv("FIVE9_USER", ""))
-        five9_pass   = st.text_input("Five9 password", os.getenv("FIVE9_PASS", ""), type="password")
-        five9_folder = st.text_input("Report folder (optional)", "")
-        five9_report = st.text_input("Report name", "")
-        today        = dt.date.today()
-        d_from       = st.date_input("From date", today)
-        d_to         = st.date_input("To date", today)
-
-    # ---------------- Load main df ----------------
-    df, source_meta = None, {}
-    if source_type == "Public CSV URL":
-        df, source_meta = fetch_csv_url(main_url)
-        if df is None: st.error(f"URL load failed: {source_meta.get('error','')}"); st.stop()
-    elif source_type == "Local folder (latest *.csv)":
-        df, source_meta = load_latest_local_csv(main_folder, main_glob)
-        if df is None: st.error(f"Local load failed: {source_meta.get('error','')}"); st.stop()
-    elif source_type == "SFTP (Five9 Scheduled)":
-        if not HAS_SFTP:
-            st.error("Please add 'paramiko' to requirements.txt."); st.stop()
-        df, source_meta = load_latest_sftp_csv(sftp_host, sftp_port, sftp_user, sftp_pass, sftp_dir, sftp_pat)
-        if df is None: st.error(f"SFTP load failed: {source_meta.get('error','')}"); st.stop()
-    elif source_type == "Five9 API (SOAP)":
-        if not HAS_ZEEP:
-            st.error("Please add 'zeep' to requirements.txt."); st.stop()
-        if not (five9_wsdl and five9_user and five9_pass and five9_report):
-            st.error("Provide WSDL, username, password, and report name."); st.stop()
-        try:
-            df, source_meta = five9_run_report_to_df(five9_wsdl, five9_user, five9_pass,
-                                                     five9_report, five9_folder or None, d_from, d_to)
-        except Exception as e:
-            st.error(f"Five9 fetch failed: {e}"); st.stop()
-    else:
-        uploaded = st.file_uploader("Main report (CSV/XLSX/XLS)", type=["csv", "xlsx", "xls"], key="main")
-        if uploaded is None:
-            st.info("Upload the main CSV/Excel file, or choose another source.")
-            st.stop()
-        df = read_any(uploaded); source_meta = {"source": "uploaded file"}
-
-    if df is None or df.empty:
-        st.warning("The main report appears to be empty."); st.stop()
-
-    # Alias "Abandoned (%rec)" -> "Abandon %"
-    for c in list(df.columns):
-        if norm(c) == norm("Abandoned (%rec)"):
-            df.rename(columns={c: "Abandon %"}, inplace=True)
-
-    st.caption(f"Loaded main report from: **{source_meta.get('source','(unknown)')}**")
-    st.subheader("Preview — Main Report (first 20 rows)")
-    st.dataframe(df.head(20), use_container_width=True)
-
-    # ---------------- Column Mapping — Main ----------------
-    st.subheader("Column Mapping — Main Report")
-
-    SKILL_SYNS  = ["skill", "skill name", "skill group", "group", "queue", "split", "team", "program", "department", "dept", "category", "line of business", "lob"]
-    CALLS_SYNS  = ["calls", "total calls", "calls offered", "offered", "inbound calls", "in calls", "total contacts", "contacts", "total interactions", "volume"]
-    AGENTS_SYNS = ["agents staffed", "agents", "agent count", "staffed agents", "distinct agents", "distinct agent count", "unique agents", "logged in agents", "logged-in agents", "logged in", "agents (distinct)", "agents (unique)"]
-    AHT_SYNS    = ["aht", "average handle time", "avg handle time", "avg handling time", "avg handle", "average handling time", "aht (s)", "aht (sec)", "talk+hold+acw", "handle time", "a.h.t", "avg hdl time", "avg handle-time"]
-    ABAND_CNT_SYNS = ["abandoned count", "abandoned", "abandon count", "aband count", "abandoned calls", "aband qty", "aband num", "aband total"]
-    ABAND_PCT_SYNS = ["abandon %", "abandoned (%rec)", "abandoned percent", "abandoned %", "abandonment rate", "abandon rate", "aband %", "aband pct", "abandonment %", "abandonment pct", "abn %", "abn pct"]
-
-    skill_guess     = find_col(df, SKILL_SYNS)
-    calls_guess     = find_col(df, CALLS_SYNS)
-    agents_guess    = find_col(df, AGENTS_SYNS)
-    aht_guess       = find_col(df, AHT_SYNS)
-    aband_cnt_guess = find_col(df, ABAND_CNT_SYNS)
-    aband_pct_guess = find_col(df, ABAND_PCT_SYNS)
-
-    cols = list(df.columns)
-    skill_col  = st.selectbox("Skill / Group column", cols, index=idx_or_default(cols, skill_guess or cols[0]))
-    calls_col  = st.selectbox("Calls column",        cols, index=idx_or_default(cols, calls_guess or cols[0]))
-    agents_col = st.selectbox("Agents Staffed column (per-skill)", cols, index=idx_or_default(cols, agents_guess or cols[0]))
-    aht_col    = st.selectbox("AHT column", cols, index=idx_or_default(cols, aht_guess or cols[0]))
-    abandoned_pct_col = st.selectbox("Abandon % column (optional)", ["<none>"] + cols,
-                                     index=idx_or_default(["<none>"]+cols, aband_pct_guess if aband_pct_guess else "<none>"))
-    abandoned_count_col = st.selectbox("Abandoned (count) column (optional, used if % is missing)", ["<none>"] + cols,
-                                       index=idx_or_default(["<none>"]+cols, aband_cnt_guess if aband_cnt_guess else "<none>"))
-
-    # Skills list (Fortress → PM Connect)
-    default_skills = ["B2B Member Success", "B2B Success Activation", "B2B Success Info", "B2B Success Tech Support",
-                      "MS Activation", "MS Info", "MS Loyalty", "MS Tech Support", "PM Connect"]
-    skills_list = st.text_area("Skills of interest (one per line)", value="\n".join(default_skills))
-    raw_skills = [s.strip() for s in skills_list.splitlines() if s.strip()]
-    skills_wanted = []
-    for s in raw_skills:
-        if s.lower() == "fortress": s = "PM Connect"
-        if s not in skills_wanted: skills_wanted.append(s)
-
-    # ---------------- Secondary report (Agents total) ----------------
-    st.sidebar.header("Second Report (Agents total) — Data Source")
-    second_source_type = st.sidebar.radio(
-        "Choose source",
-        ["Manual upload", "Public CSV URL", "Local folder (latest *.csv)", "SFTP (Five9 Scheduled)", "Five9 API (SOAP)"],
-        index=0,
-    )
-
-    second_df, second_meta = None, {}
-    if second_source_type == "Public CSV URL":
-        url2 = st.sidebar.text_input("2nd CSV URL", os.getenv("SECOND_CSV_URL", ""))
-        if url2: second_df, second_meta = fetch_csv_url(url2)
-    elif second_source_type == "Local folder (latest *.csv)":
-        fold2 = st.sidebar.text_input("2nd local folder", "./data2")
-        pat2  = st.sidebar.text_input("2nd filename pattern", "*.csv")
-        second_df, second_meta = load_latest_local_csv(fold2, pat2)
-    elif second_source_type == "SFTP (Five9 Scheduled)":
-        with st.sidebar.expander("SFTP settings (2nd report)", expanded=False):
-            sftp2_host = st.text_input("Host (2nd)", "")
-            sftp2_port = st.number_input("Port (2nd)", 1, 65535, 22)
-            sftp2_user = st.text_input("Username (2nd)", "")
-            sftp2_pass = st.text_input("Password (2nd)", "", type="password")
-            sftp2_dir  = st.text_input("Remote directory (2nd)", "/")
-            sftp2_pat  = st.text_input("Filename pattern (2nd)", "*.csv")
-        if HAS_SFTP and sftp2_host and sftp2_user:
-            second_df, second_meta = load_latest_sftp_csv(sftp2_host, sftp2_port, sftp2_user, sftp2_pass, sftp2_dir, sftp2_pat)
-    elif second_source_type == "Five9 API (SOAP)":
-        with st.sidebar.expander("Five9 settings (2nd)", expanded=False):
-            f_wsdl = st.text_input("WSDL URL (2nd)", value=os.getenv("FIVE9_WSDL", "https://api.five9.com/wsadmin/v12/AdminWebService?wsdl"))
-            f_user = st.text_input("Username (2nd)", value=os.getenv("FIVE9_USER", ""))
-            f_pass = st.text_input("Password (2nd)", value=os.getenv("FIVE9_PASS", ""), type="password")
-            f_folder = st.text_input("Report folder (2nd) optional", value="")
-            f_report = st.text_input("Report name (2nd)", value="")
-            f_from   = st.date_input("From (2nd)", dt.date.today())
-            f_to     = st.date_input("To (2nd)",   dt.date.today())
-        if f_report and HAS_ZEEP:
-            try:
-                second_df, second_meta = five9_run_report_to_df(f_wsdl, f_user, f_pass, f_report, f_folder or None, f_from, f_to)
-            except Exception as e:
-                st.sidebar.error(f"Five9 2nd fetch failed: {e}")
-    else:
-        uploaded2 = st.file_uploader("Second report (CSV/XLSX/XLS) — overall totals / no skill filter (optional)", type=["csv", "xlsx", "xls"], key="second")
-        if uploaded2 is not None:
-            second_df = read_any(uploaded2)
-
-    if second_df is not None and not second_df.empty:
-        for c in list(second_df.columns):
-            if norm(c) == norm("Abandoned (%rec)"):
-                second_df.rename(columns={c: "Abandon %"}, inplace=True)
-        st.caption(f"Loaded 2nd report from: **{second_meta.get('source','uploaded file')}**")
-        st.dataframe(second_df.head(10), use_container_width=True)
-
-    # ---------------- Calculations ----------------
-    for c in [skill_col, calls_col, agents_col, aht_col]:
-        if c not in df.columns:
-            st.error(f"Selected column not found: {c}")
-            st.stop()
-
-    df[skill_col] = df[skill_col].astype(str).str.strip()
-    df.loc[df[skill_col].str.lower() == "fortress", skill_col] = "PM Connect"
-
-    calls_num  = pd.to_numeric(df[calls_col],  errors="coerce").fillna(0)
-    agents_num = pd.to_numeric(df[agents_col], errors="coerce").fillna(0)
-
-    rates = None
-    if abandoned_pct_col != "<none>" and abandoned_pct_col in df.columns:
-        rates = to_percent(df[abandoned_pct_col])
-
-    if rates is None and abandoned_count_col != "<none>" and abandoned_count_col in df.columns:
-        aband_num = pd.to_numeric(df[abandoned_count_col], errors="coerce")
-        with pd.option_context('mode.use_inf_as_na', True):
-            rates = (aband_num / calls_num.replace(0, pd.NA)) * 100
-
-    total_calls = int(calls_num.sum())
-
-    total_agents = int(agents_num.sum())
-    agents_label = "Agents Staffed (sum of per-skill)"
-    if second_df is not None and not second_df.empty:
-        agents2_guess = find_col(second_df, AGENTS_SYNS) or next((c for c in second_df.columns if "agent" in c.lower()), None)
-        if agents2_guess:
-            agents2_num = pd.to_numeric(second_df[agents2_guess], errors="coerce").fillna(0)
-            total_agents = int(agents2_num.sum())
-            agents_label = "Agents Staffed (from 2nd report)"
-
-    if (abandoned_count_col != "<none>" and abandoned_count_col in df.columns and total_calls > 0):
-        aband_num_total = pd.to_numeric(df[abandoned_count_col], errors="coerce").fillna(0).sum()
-        total_abandon_pct = (aband_num_total / total_calls) * 100
-    elif rates is not None and total_calls > 0:
-        total_abandon_pct = ((rates.fillna(0) / 100.0) * calls_num).sum() / total_calls * 100
-    else:
-        total_abandon_pct = None
-
-    by_skill_core = pd.DataFrame({
-        "SKILL": df[skill_col].astype(str),
-        "CALLS": calls_num.astype("Int64"),
-        "Agents Staffed": agents_num.astype("Int64"),
-        "AHT": df[aht_col].astype(str),
+    out = pd.DataFrame({
+        "Skill": [i[0] for i in calls_sum.index],
+        "period": [i[1] for i in calls_sum.index],
+        "Calls": calls_sum.values,
+        "AHT_sec": aht_w.values,
+        "Abandon %": ab_pct.values
     })
-    if rates is not None:
-        by_skill_core["Abandon %"] = rates.round(2).astype(str) + "%"
-    else:
-        by_skill_core["Abandon %"] = "N/A"
+    out["AHT"] = out["AHT_sec"].apply(format_seconds)
+    out.sort_values(["Skill", "period"], inplace=True)
+    return out
 
-    # ---------------- Filled Report (Markdown) ----------------
-    md = io.StringIO()
-    def writeln(s=""): md.write(s + "\n")
-    writeln("## Autofilled Metrics (Core)\n")
-    writeln(f"### 3. Total Calls\n**{total_calls}**\n")
-    writeln(f"### 4. {agents_label}\n**{total_agents}**\n")
-    writeln("### 6. Abandon %")
-    writeln(f"**{(str(round(total_abandon_pct, 2)) + '%') if total_abandon_pct is not None else 'N/A'}**\n")
-    writeln("### 7. AHT (By Group)")
-    for sk in skills_wanted:
-        mask = by_skill_core["SKILL"].str.lower() == sk.lower()
-        val = by_skill_core.loc[mask, "AHT"]
-        writeln(f"- **{sk}:** {val.iloc[0] if len(val) else 'Not found in this report'}")
-    writeln("\n### 8. Abandon % (By Group)")
-    for sk in skills_wanted:
-        mask = by_skill_core["SKILL"].str.lower() == sk.lower()
-        val = by_skill_core.loc[mask, "Abandon %"]
-        writeln(f"- **{sk}:** {val.iloc[0] if len(val) else 'Not found in this report'}")
-    report_md = md.getvalue()
+def build_excel_bytes(sheets: dict[str, pd.DataFrame]) -> bytes:
+    import openpyxl  # ensure engine is available
+    bio = io.BytesIO()
+    with pd.ExcelWriter(bio, engine="openpyxl") as writer:
+        for sheet_name, df_ in sheets.items():
+            df_.to_excel(writer, index=False, sheet_name=sheet_name[:31] or "Sheet1")
+    bio.seek(0)
+    return bio.read()
 
-    # ---------------- UI ----------------
-    st.subheader("Filled Report (Core)")
-    st.markdown(report_md)
+# ---------- App ----------
+st.title("🧮 Autofill Numbers — Core Fields")
+st.caption("Upload CSV/XLSX, or point at a URL or local folder. Includes auto-refresh, charts, and trend tables.")
 
-    st.subheader("Copy & Paste")
-    tabs = st.tabs(["📋 Report (Markdown)", "📋 KPIs (CSV)", "📋 By-Skill Core Table (CSV)", "📋 By-Skill Core Table (TSV)", "📋 Preview (first 20 rows CSV)"])
-    with tabs[0]:
-        st.code(report_md, language="markdown")
-    with tabs[1]:
-        kpi_df = pd.DataFrame([{
-            "Total Calls": total_calls,
-            "Agents Staffed": total_agents,
-            "Total Abandon %": (round(total_abandon_pct, 2) if total_abandon_pct is not None else None)
-        }])
-        disp = kpi_df.copy()
-        if disp.loc[0, "Total Abandon %"] is not None:
-            disp.loc[0, "Total Abandon %"] = f"{disp.loc[0, 'Total Abandon %']:.2f}%"
-        st.dataframe(disp, use_container_width=True)
-        st.code(kpi_df.to_csv(index=False), language="text")
-    with tabs[2]:
-        st.dataframe(by_skill_core, use_container_width=True)
-        st.code(by_skill_core.to_csv(index=False), language="text")
-    with tabs[3]:
-        st.dataframe(by_skill_core, use_container_width=True)
-        st.code(by_skill_core.to_csv(index=False, sep="\t"), language="text")
-    with tabs[4]:
-        prev_csv = df.head(20).to_csv(index=False)
-        st.dataframe(df.head(20), use_container_width=True)
-        st.code(prev_csv, language="text")
+# Auto-refresh
+st.sidebar.header("Auto-refresh")
+auto_refresh = st.sidebar.checkbox("Enable auto-refresh", value=False)
+refresh_secs = st.sidebar.number_input("Interval (seconds)", 10, 3600, 60, 5)
+if auto_refresh:
+    now = time.time()
+    last = st.session_state.get("_last_refresh_ts", 0.0)
+    if now - last >= refresh_secs:
+        st.session_state["_last_refresh_ts"] = now
+        st.rerun()
+if st.sidebar.button("🔄 Reload now"):
+    st.session_state["_last_refresh_ts"] = time.time()
+    st.rerun()
 
-    st.subheader("Downloads")
-    st.download_button("⬇️ Download report (Markdown)", data=report_md.encode("utf-8"),
-                       file_name="filled_report_core.md", mime="text/markdown")
+# Data source
+st.sidebar.header("Main Report — Data Source")
+source_type = st.sidebar.radio("Choose source",
+                               ["Manual upload", "Public CSV URL", "Local folder (latest *.csv)"],
+                               index=0)
+main_url    = st.sidebar.text_input("Main CSV URL", os.getenv("MAIN_CSV_URL", ""))
+main_folder = st.sidebar.text_input("Main local folder", "./data")
+main_glob   = st.sidebar.text_input("Main filename pattern", "*.csv")
 
-    st.subheader("By-Skill Table — Core Fields")
+# Load data
+df, source_meta = None, {}
+if source_type == "Public CSV URL":
+    df, source_meta = try_fetch_csv_url(main_url)
+    if df is None:
+        st.error(f"URL load failed: {source_meta.get('error','')}"); st.stop()
+elif source_type == "Local folder (latest *.csv)":
+    df, source_meta = load_latest_local_csv(main_folder, main_glob)
+    if df is None:
+        st.error(f"Local load failed: {source_meta.get('error','')}"); st.stop()
+else:
+    uploaded = st.file_uploader("Main report (CSV/XLSX/XLS)", type=["csv", "xlsx", "xls"], key="main")
+    if uploaded is None:
+        st.info("Upload the main CSV/Excel file, or choose another source.")
+        st.stop()
+    df = read_any(uploaded); source_meta = {"source": "uploaded file"}
+
+if df is None or df.empty:
+    st.warning("The main report appears to be empty."); st.stop()
+
+# Normalize column rename: "Abandoned (%rec)" -> "Abandon %"
+for c in list(df.columns):
+    if norm(c) == norm("Abandoned (%rec)"):
+        df.rename(columns={c: "Abandon %"}, inplace=True)
+
+st.caption(f"Loaded main report from: **{source_meta.get('source','(unknown)')}**")
+st.subheader("Preview — Main Report (first 20 rows)")
+st.dataframe(df.head(20), use_container_width=True)
+
+# Column mapping
+st.subheader("Column Mapping — Main Report")
+
+SKILL_SYNS  = ["skill", "skill name", "skill group", "group", "queue", "split", "team", "program", "department", "dept", "category", "line of business", "lob"]
+CALLS_SYNS  = ["calls", "total calls", "calls offered", "offered", "inbound calls", "in calls", "total contacts", "contacts", "total interactions", "volume"]
+AGENTS_SYNS = ["agents staffed", "agents", "agent count", "staffed agents", "distinct agents", "distinct agent count", "unique agents", "logged in agents", "logged-in agents", "agents (distinct)", "agents (unique)"]
+AHT_SYNS    = ["aht", "average handle time", "avg handle time", "avg handling time", "avg handle", "average handling time", "aht (s)", "aht (sec)", "talk+hold+acw", "handle time", "a.h.t", "avg hdl time", "avg handle-time"]
+ABAND_CNT_SYNS = ["abandoned count", "abandoned", "abandon count", "aband count", "abandoned calls", "aband qty", "aband num", "aband total"]
+ABAND_PCT_SYNS = ["abandon %", "abandoned (%rec)", "abandoned percent", "abandoned %", "abandonment rate", "abandon rate", "aband %", "aband pct", "abandonment %", "abandonment pct", "abn %", "abn pct"]
+DATE_SYNS   = ["date", "day", "datetime", "date/time", "interval start", "start time", "timestamp", "report date"]
+
+skill_guess     = find_col(df, SKILL_SYNS)
+calls_guess     = find_col(df, CALLS_SYNS)
+agents_guess    = find_col(df, AGENTS_SYNS)
+aht_guess       = find_col(df, AHT_SYNS)
+aband_cnt_guess = find_col(df, ABAND_CNT_SYNS)
+aband_pct_guess = find_col(df, ABAND_PCT_SYNS)
+date_guess      = find_col(df, DATE_SYNS)
+
+cols = list(df.columns)
+skill_col  = st.selectbox("Skill / Group column", cols, index=idx_or_default(cols, skill_guess or cols[0]))
+calls_col  = st.selectbox("Calls column",        cols, index=idx_or_default(cols, calls_guess or cols[0]))
+agents_col = st.selectbox("Agents Staffed column (per-skill)", cols, index=idx_or_default(cols, agents_guess or cols[0]))
+aht_col    = st.selectbox("AHT column", cols, index=idx_or_default(cols, aht_guess or cols[0]))
+abandoned_pct_col = st.selectbox("Abandon % column (optional)", ["<none>"] + cols,
+                                 index=idx_or_default(["<none>"]+cols, aband_pct_guess if aband_pct_guess else "<none>"))
+abandoned_count_col = st.selectbox("Abandoned (count) column (optional, used if % is missing)", ["<none>"] + cols,
+                                   index=idx_or_default(["<none>"]+cols, aband_cnt_guess if aband_cnt_guess else "<none>"))
+date_col = st.selectbox("Date/Time column (required for trends)", ["<none>"] + cols,
+                        index=idx_or_default(["<none>"]+cols, date_guess if date_guess else "<none>"))
+
+# Skills list (Fortress → PM Connect)
+default_skills = ["B2B Member Success", "B2B Success Activation", "B2B Success Info", "B2B Success Tech Support",
+                  "MS Activation", "MS Info", "MS Loyalty", "MS Tech Support", "PM Connect"]
+skills_list = st.text_area("Skills of interest (one per line)", value="\n".join(default_skills))
+raw_skills = [s.strip() for s in skills_list.splitlines() if s.strip()]
+skills_wanted = []
+for s in raw_skills:
+    if s.lower() == "fortress": s = "PM Connect"
+    if s not in skills_wanted: skills_wanted.append(s)
+
+# Secondary report (Agents total) — optional
+st.sidebar.header("Second Report (Agents total) — Data Source")
+second_source_type = st.sidebar.radio("Choose source",
+                                      ["Manual upload", "Public CSV URL", "Local folder (latest *.csv)"],
+                                      index=0)
+second_df, second_meta = None, {}
+if second_source_type == "Public CSV URL":
+    url2 = st.sidebar.text_input("2nd CSV URL", os.getenv("SECOND_CSV_URL", ""))
+    if url2: second_df, second_meta = try_fetch_csv_url(url2)
+elif second_source_type == "Local folder (latest *.csv)":
+    fold2 = st.sidebar.text_input("2nd local folder", "./data2")
+    pat2  = st.sidebar.text_input("2nd filename pattern", "*.csv")
+    second_df, second_meta = load_latest_local_csv(fold2, pat2)
+else:
+    uploaded2 = st.file_uploader("Second report (CSV/XLSX/XLS) — overall totals / no skill filter (optional)",
+                                 type=["csv", "xlsx", "xls"], key="second")
+    if uploaded2 is not None:
+        second_df = read_any(uploaded2)
+
+if second_df is not None and not second_df.empty:
+    for c in list(second_df.columns):
+        if norm(c) == norm("Abandoned (%rec)"):
+            second_df.rename(columns={c: "Abandon %"}, inplace=True)
+    st.caption(f"Loaded 2nd report from: **{second_meta.get('source','uploaded file')}**")
+    st.dataframe(second_df.head(10), use_container_width=True)
+
+# ---------- Core calculations ----------
+for c in [skill_col, calls_col, agents_col, aht_col]:
+    if c not in df.columns:
+        st.error(f"Selected column not found: {c}")
+        st.stop()
+
+df[skill_col] = df[skill_col].astype(str).str.strip()
+df.loc[df[skill_col].str.lower() == "fortress", skill_col] = "PM Connect"
+
+calls_num  = pd.to_numeric(df[calls_col],  errors="coerce").fillna(0)
+agents_num = pd.to_numeric(df[agents_col], errors="coerce").fillna(0)
+
+rates = None
+if abandoned_pct_col != "<none>" and abandoned_pct_col in df.columns:
+    rates = to_percent(df[abandoned_pct_col])
+aband_count_col_final = None
+if rates is None and abandoned_count_col != "<none>" and abandoned_count_col in df.columns:
+    aband_count_col_final = abandoned_count_col
+
+total_calls = int(calls_num.sum())
+
+total_agents = int(agents_num.sum())
+agents_label = "Agents Staffed (sum of per-skill)"
+if second_df is not None and not second_df.empty:
+    agents2_guess = find_col(second_df, AGENTS_SYNS) or next((c for c in second_df.columns if "agent" in c.lower()), None)
+    if agents2_guess:
+        agents2_num = pd.to_numeric(second_df[agents2_guess], errors="coerce").fillna(0)
+        total_agents = int(agents2_num.sum())
+        agents_label = "Agents Staffed (from 2nd report)"
+
+if aband_count_col_final and total_calls > 0:
+    aband_num_total = pd.to_numeric(df[aband_count_col_final], errors="coerce").fillna(0).sum()
+    total_abandon_pct = (aband_num_total / total_calls) * 100
+elif rates is not None and total_calls > 0:
+    total_abandon_pct = ((rates.fillna(0) / 100.0) * calls_num).sum() / total_calls * 100
+else:
+    total_abandon_pct = None
+
+by_skill_core = pd.DataFrame({
+    "SKILL": df[skill_col].astype(str),
+    "CALLS": calls_num.astype("Int64"),
+    "Agents Staffed": agents_num.astype("Int64"),
+    "AHT": df[aht_col].astype(str),
+})
+by_skill_core["Abandon %"] = (rates.round(2).astype(str) + "%") if rates is not None else "N/A"
+
+# ---------- Filled Report (Markdown) ----------
+md = io.StringIO()
+def writeln(s=""): md.write(s + "\n")
+writeln("## Autofilled Metrics (Core)\n")
+writeln(f"### 3. Total Calls\n**{total_calls}**\n")
+writeln(f"### 4. {agents_label}\n**{total_agents}**\n")
+writeln("### 6. Abandon %")
+writeln(f"**{(str(round(total_abandon_pct, 2)) + '%') if total_abandon_pct is not None else 'N/A'}**\n")
+writeln("### 7. AHT (By Group)")
+for sk in skills_wanted:
+    mask = by_skill_core["SKILL"].str.lower() == sk.lower()
+    val = by_skill_core.loc[mask, "AHT"]
+    writeln(f"- **{sk}:** {val.iloc[0] if len(val) else 'Not found in this report'}")
+writeln("\n### 8. Abandon % (By Group)")
+for sk in skills_wanted:
+    mask = by_skill_core["SKILL"].str.lower() == sk.lower()
+    val = by_skill_core.loc[mask, "Abandon %"]
+    writeln(f"- **{sk}:** {val.iloc[0] if len(val) else 'Not found in this report'}")
+report_md = md.getvalue()
+
+# ---------- UI: Core ----------
+st.subheader("Filled Report (Core)")
+st.markdown(report_md)
+
+st.subheader("Copy & Paste")
+tabs = st.tabs(["📋 Report (Markdown)", "📋 KPIs (CSV)", "📋 By-Skill Core Table (CSV)", "📋 By-Skill Core Table (TSV)", "📋 Preview (first 20 rows CSV)"])
+with tabs[0]:
+    st.code(report_md, language="markdown")
+with tabs[1]:
+    kpi_df = pd.DataFrame([{
+        "Total Calls": total_calls,
+        "Agents Staffed": total_agents,
+        "Total Abandon %": (round(total_abandon_pct, 2) if total_abandon_pct is not None else None)
+    }])
+    disp = kpi_df.copy()
+    if disp.loc[0, "Total Abandon %"] is not None:
+        disp.loc[0, "Total Abandon %"] = f"{disp.loc[0, 'Total Abandon %']:.2f}%"
+    st.dataframe(disp, use_container_width=True)
+    st.code(kpi_df.to_csv(index=False), language="text")
+with tabs[2]:
     st.dataframe(by_skill_core, use_container_width=True)
+    st.code(by_skill_core.to_csv(index=False), language="text")
+with tabs[3]:
+    st.dataframe(by_skill_core, use_container_width=True)
+    st.code(by_skill_core.to_csv(index=False, sep="\t"), language="text")
+with tabs[4]:
+    prev_csv = df.head(20).to_csv(index=False)
+    st.dataframe(df.head(20), use_container_width=True)
+    st.code(prev_csv, language="text")
 
-    # Word export
-    if HAS_DOCX:
-        def build_docx(md_text):
-            doc = Document(); doc.add_heading("Autofilled Metrics (Core)", level=1)
-            for line in md_text.splitlines():
-                if line.startswith("### "): doc.add_heading(line.replace("### ", ""), level=2)
-                elif line.startswith("## "): continue
-                else:
-                    if line.strip(): doc.add_paragraph(line)
-            bio = io.BytesIO(); doc.save(bio); bio.seek(0); return bio.getvalue()
-        st.download_button("⬇️ Download report (Word .docx)", data=build_docx(report_md),
-                           file_name="filled_report_core.docx",
-                           mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document")
+st.subheader("Downloads")
+st.download_button("⬇️ Download report (Markdown)", data=report_md.encode("utf-8"),
+                   file_name="filled_report_core.md", mime="text/markdown")
+
+st.subheader("By-Skill Table — Core Fields")
+st.dataframe(by_skill_core, use_container_width=True)
+
+# ---------- Skill Trends ----------
+st.markdown("---")
+st.header("📈 Skill Trends — AHT & Abandon % (Daily / Weekly / Monthly)")
+
+if date_col == "<none>":
+    st.info("Pick a **Date/Time column** above to enable trend charts.")
+else:
+    # Prepare numeric AHT seconds + time columns
+    df_time = df.copy()
+    df_time.loc[df_time[skill_col].astype(str).str.lower() == "fortress", skill_col] = "PM Connect"
+    df_time["_AHT_sec"] = df_time[aht_col].apply(parse_duration_to_seconds)
+    df_time = add_time_columns(df_time, date_col)
+    rate_series = rates  # may be None
+
+    # Aggregations for ALL skills at once (fast + reusable)
+    daily_all   = aggregate_by_period_all_skills(df_time, skill_col, calls_col, "_AHT_sec", rate_series, aband_count_col_final, "_DATE")
+    weekly_all  = aggregate_by_period_all_skills(df_time, skill_col, calls_col, "_AHT_sec", rate_series, aband_count_col_final, "_WEEK_START")
+    monthly_all = aggregate_by_period_all_skills(df_time, skill_col, calls_col, "_AHT_sec", rate_series, aband_count_col_final, "_MONTH_START")
+
+    # Single-skill view
+    all_skills_sorted = sorted(df_time[skill_col].astype(str).unique())
+    skill_choice = st.selectbox("Single skill", all_skills_sorted, index=idx_or_default(all_skills_sorted, "PM Connect" if "PM Connect" in all_skills_sorted else all_skills_sorted[0]))
+
+    def filter_skill(df_in, skill):
+        return df_in[df_in["Skill"].astype(str).str.lower() == skill.lower()].copy()
+
+    daily   = filter_skill(daily_all,   skill_choice)
+    weekly  = filter_skill(weekly_all,  skill_choice)
+    monthly = filter_skill(monthly_all, skill_choice)
+
+    # KPI cards
+    def delta_str(series):
+        if len(series) < 2 or pd.isna(series.iloc[-2]) or pd.isna(series.iloc[-1]): return "—"
+        diff = series.iloc[-1] - series.iloc[-2]
+        sign = "▲" if diff > 0 else ("▼" if diff < 0 else "—")
+        return f"{sign} {diff:.2f}"
+
+    k1, k2, k3, k4 = st.columns(4)
+    with k1:
+        st.metric("Last AHT (Daily)", daily["AHT"].iloc[-1] if not daily.empty else "N/A",
+                  delta=delta_str(daily["AHT_sec"]) if not daily.empty else "—")
+    with k2:
+        st.metric("Last Abandon % (Daily)", f"{daily['Abandon %'].iloc[-1]:.2f}%" if (not daily.empty and pd.notna(daily['Abandon %'].iloc[-1])) else "N/A",
+                  delta=delta_str(daily["Abandon %"]) if not daily.empty else "—")
+    with k3:
+        st.metric("Last AHT (Weekly)", weekly["AHT"].iloc[-1] if not weekly.empty else "N/A",
+                  delta=delta_str(weekly["AHT_sec"]) if not weekly.empty else "—")
+    with k4:
+        st.metric("Last Abandon % (Weekly)", f"{weekly['Abandon %'].iloc[-1]:.2f}%" if (not weekly.empty and pd.notna(weekly['Abandon %'].iloc[-1])) else "N/A",
+                  delta=delta_str(weekly["Abandon %"]) if not weekly.empty else "—")
+
+    # Chart helper
+    def line_chart(df_in: pd.DataFrame, y_col: str, y_title: str):
+        if df_in.empty:
+            st.info("No data available.")
+            return
+        chart = (
+            alt.Chart(df_in)
+            .mark_line(point=True)
+            .encode(
+                x=alt.X("period:T", title="Period"),
+                y=alt.Y(f"{y_col}:Q", title=y_title),
+                tooltip=[
+                    alt.Tooltip("period:T", title="Period"),
+                    alt.Tooltip("Calls:Q", title="Calls", format=",.0f"),
+                    alt.Tooltip("AHT:N", title="AHT"),
+                    alt.Tooltip("Abandon %:Q", title="Abandon %", format=".2f")
+                ]
+            )
+            .properties(height=280, width="container")
+        )
+        st.altair_chart(chart, use_container_width=True)
+
+    # Single skill — Daily/Weekly/Monthly
+    st.subheader(f"Daily — {skill_choice}")
+    c1, c2 = st.columns(2)
+    with c1:
+        tmp = daily.copy(); tmp["AHT_numeric"] = tmp["AHT_sec"]
+        line_chart(tmp.rename(columns={"AHT_numeric": "AHT_sec"}), "AHT_sec", "AHT (seconds)")
+    with c2:
+        line_chart(daily, "Abandon %", "Abandon %")
+    st.dataframe(daily.assign(**{"Abandon %": daily["Abandon %"].round(2)}), use_container_width=True)
+
+    st.subheader(f"Weekly — {skill_choice}")
+    c3, c4 = st.columns(2)
+    with c3:
+        tmp = weekly.copy(); tmp["AHT_numeric"] = tmp["AHT_sec"]
+        line_chart(tmp.rename(columns={"AHT_numeric": "AHT_sec"}), "AHT_sec", "AHT (seconds)")
+    with c4:
+        line_chart(weekly, "Abandon %", "Abandon %")
+    st.dataframe(weekly.assign(**{"Abandon %": weekly["Abandon %"].round(2)}), use_container_width=True)
+
+    st.subheader(f"Monthly — {skill_choice}")
+    c5, c6 = st.columns(2)
+    with c5:
+        tmp = monthly.copy(); tmp["AHT_numeric"] = tmp["AHT_sec"]
+        line_chart(tmp.rename(columns={"AHT_numeric": "AHT_sec"}), "AHT_sec", "AHT (seconds)")
+    with c6:
+        line_chart(monthly, "Abandon %", "Abandon %")
+    st.dataframe(monthly.assign(**{"Abandon %": monthly["Abandon %"].round(2)}), use_container_width=True)
+
+    # Downloads — single skill
+    single_sheets = {
+        "Daily":   daily.assign(**{"Abandon %": daily["Abandon %"].round(2)}),
+        "Weekly":  weekly.assign(**{"Abandon %": weekly["Abandon %"].round(2)}),
+        "Monthly": monthly.assign(**{"Abandon %": monthly["Abandon %"].round(2)}),
+    }
+    st.download_button("⬇️ Download single-skill trends (Excel)", data=build_excel_bytes(single_sheets),
+                       file_name=f"{norm(skill_choice)}_trends.xlsx",
+                       mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+    st.download_button("⬇️ Download single-skill Daily (CSV)", data=single_sheets["Daily"].to_csv(index=False).encode("utf-8"),
+                       file_name=f"{norm(skill_choice)}_daily.csv", mime="text/csv")
+
+    # ---------- Multi-skill compare ----------
+    st.markdown("---")
+    st.header("🔀 Multi-skill Compare (overlay)")
+
+    all_skills_sorted = sorted(daily_all["Skill"].unique().tolist())
+    default_preselect = [s for s in ["PM Connect"] if s in all_skills_sorted] or all_skills_sorted[:3]
+    multi = st.multiselect("Select skills to compare", all_skills_sorted, default=default_preselect)
+
+    def overlay_chart(df_in: pd.DataFrame, y_col: str, title: str):
+        if df_in.empty:
+            st.info("No data for the selected skills.")
+            return
+        chart = (
+            alt.Chart(df_in)
+            .mark_line(point=True)
+            .encode(
+                x=alt.X("period:T", title="Period"),
+                y=alt.Y(f"{y_col}:Q", title=title),
+                color=alt.Color("Skill:N", legend=alt.Legend(title="Skill")),
+                tooltip=[
+                    alt.Tooltip("Skill:N"),
+                    alt.Tooltip("period:T", title="Period"),
+                    alt.Tooltip("Calls:Q", format=",.0f"),
+                    alt.Tooltip("AHT:N"),
+                    alt.Tooltip("Abandon %:Q", format=".2f")
+                ]
+            )
+            .properties(height=320, width="container")
+        )
+        st.altair_chart(chart, use_container_width=True)
+
+    if multi:
+        d_daily   = daily_all[daily_all["Skill"].isin(multi)].copy()
+        d_weekly  = weekly_all[weekly_all["Skill"].isin(multi)].copy()
+        d_monthly = monthly_all[monthly_all["Skill"].isin(multi)].copy()
+
+        st.subheader("Daily compare")
+        oc1, oc2 = st.columns(2)
+        with oc1:
+            t = d_daily.copy(); t["AHT_numeric"] = t["AHT_sec"]
+            overlay_chart(t.rename(columns={"AHT_numeric":"AHT_sec"}), "AHT_sec", "AHT (seconds)")
+        with oc2:
+            overlay_chart(d_daily, "Abandon %", "Abandon %")
+        st.dataframe(d_daily.assign(**{"Abandon %": d_daily["Abandon %"].round(2)}), use_container_width=True)
+
+        st.subheader("Weekly compare")
+        oc3, oc4 = st.columns(2)
+        with oc3:
+            t = d_weekly.copy(); t["AHT_numeric"] = t["AHT_sec"]
+            overlay_chart(t.rename(columns={"AHT_numeric":"AHT_sec"}), "AHT_sec", "AHT (seconds)")
+        with oc4:
+            overlay_chart(d_weekly, "Abandon %", "Abandon %")
+        st.dataframe(d_weekly.assign(**{"Abandon %": d_weekly["Abandon %"].round(2)}), use_container_width=True)
+
+        st.subheader("Monthly compare")
+        oc5, oc6 = st.columns(2)
+        with oc5:
+            t = d_monthly.copy(); t["AHT_numeric"] = t["AHT_sec"]
+            overlay_chart(t.rename(columns={"AHT_numeric":"AHT_sec"}), "AHT_sec", "AHT (seconds)")
+        with oc6:
+            overlay_chart(d_monthly, "Abandon %", "Abandon %")
+        st.dataframe(d_monthly.assign(**{"Abandon %": d_monthly["Abandon %"].round(2)}), use_container_width=True)
+
+        # Downloads — multi
+        compare_sheets = {
+            "Daily":   d_daily.assign(**{"Abandon %": d_daily["Abandon %"].round(2)}),
+            "Weekly":  d_weekly.assign(**{"Abandon %": d_weekly["Abandon %"].round(2)}),
+            "Monthly": d_monthly.assign(**{"Abandon %": d_monthly["Abandon %"].round(2)}),
+        }
+        st.download_button("⬇️ Download compare trends (Excel)", data=build_excel_bytes(compare_sheets),
+                           file_name=f"compare_trends_{len(multi)}_skills.xlsx",
+                           mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+        st.download_button("⬇️ Download compare Daily (CSV)", data=compare_sheets["Daily"].to_csv(index=False).encode("utf-8"),
+                           file_name=f"compare_daily.csv", mime="text/csv")
     else:
-        st.info("python-docx not installed; Word export disabled.")
+        st.info("Select 1+ skills above to see overlay charts.")
 
-    # PDF export
-    if HAS_PDF:
-        def build_pdf(md_text):
-            bio = io.BytesIO(); c = canvas.Canvas(bio, pagesize=letter)
-            width, height = letter; L = 0.75 * inch; T = 0.75 * inch; B = 0.75 * inch
-            y = height - T; c.setFont("Times-Bold", 14); c.drawString(L, y, "Autofilled Metrics (Core)"); y -= 0.3*inch
-            c.setFont("Times-Roman", 11); import textwrap as _tw
-            for line in md_text.splitlines():
-                if not line.strip(): y -= 0.18*inch
-                else:
-                    for w in _tw.wrap(line, width=95): c.drawString(L, y, w); y -= 0.18*inch
-                if y < B: c.showPage(); y = height - T; c.setFont("Times-Roman", 11)
-            c.showPage(); c.save(); bio.seek(0); return bio.getvalue()
-        st.download_button("⬇️ Download report (PDF)", data=build_pdf(report_md),
-                           file_name="filled_report_core.pdf", mime="application/pdf")
-    else:
-        st.info("reportlab not installed; PDF export disabled.")
+# ---------- Optional Word/PDF exports for the core markdown ----------
+try:
+    from docx import Document
+    def build_docx(md_text):
+        doc = Document(); doc.add_heading("Autofilled Metrics (Core)", level=1)
+        for line in md_text.splitlines():
+            if line.startswith("### "): doc.add_heading(line.replace("### ", ""), level=2)
+            elif line.startswith("## "): continue
+            else:
+                if line.strip(): doc.add_paragraph(line)
+        bio = io.BytesIO(); doc.save(bio); bio.seek(0); return bio.getvalue()
+    st.download_button("⬇️ Download core report (Word .docx)", data=build_docx(report_md),
+                       file_name="filled_report_core.docx",
+                       mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document")
+except Exception:
+    st.info("python-docx not installed; Word export disabled.")
 
-# ---------- Boot ----------
-if require_login():
-    run_app()
+try:
+    from reportlab.lib.pagesizes import letter
+    from reportlab.pdfgen import canvas
+    from reportlab.lib.units import inch
+    def build_pdf(md_text):
+        bio = io.BytesIO(); c = canvas.Canvas(bio, pagesize=letter)
+        width, height = letter; L = 0.75 * inch; T = 0.75 * inch; B = 0.75 * inch
+        y = height - T; c.setFont("Times-Bold", 14); c.drawString(L, y, "Autofilled Metrics (Core)"); y -= 0.3*inch
+        c.setFont("Times-Roman", 11); import textwrap as _tw
+        for line in md_text.splitlines():
+            if not line.strip(): y -= 0.18*inch
+            else:
+                for w in _tw.wrap(line, width=95): c.drawString(L, y, w); y -= 0.18*inch
+            if y < B: c.showPage(); y = height - T; c.setFont("Times-Roman", 11)
+        c.showPage(); c.save(); bio.seek(0); return bio.getvalue()
+    st.download_button("⬇️ Download core report (PDF)", data=build_pdf(report_md),
+                       file_name="filled_report_core.pdf", mime="application/pdf")
+except Exception:
+    st.info("reportlab not installed; PDF export disabled.")
