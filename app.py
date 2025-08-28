@@ -1,19 +1,7 @@
-# app.py — Metrics Report with Historical Store + Altair duplicate-column fix
-# Works well with Python 3.12 (use runtime.txt "python-3.12")
-#
-# requirements.txt (recommended):
-# streamlit==1.36.0
-# pandas==2.2.2
-# numpy==1.26.4
-# altair==5.2.0
-# openpyxl==3.1.5
-# xlrd==2.0.1
-# requests==2.32.3
-# python-docx==1.1.2
-# reportlab==4.2.2
-# fpdf2==2.7.9
+# app.py — Metrics Report (Patriot-inspired theme, store-timestamped trends, no logo upload)
+# Python 3.12 recommended (runtime.txt -> python-3.12)
 
-import os, io, re, glob, time, base64, json, hashlib
+import os, io, re, glob, time, base64, hashlib
 import numpy as np
 import pandas as pd
 import streamlit as st
@@ -31,112 +19,136 @@ try:
 except Exception:
     HAS_REQUESTS = False
 
-# ---------- Brand colors ----------
-PM_RED   = "#C8102E"
-PM_NAVY  = "#0B2D52"
-PM_WHITE = "#FFFFFF"
-PM_GRAY  = "#D7DBE2"
-
+# ---------- Page config ----------
 st.set_page_config(page_title="Metrics Report", layout="wide")
 
-# ================== Sidebar: Brand & Logo ==================
-with st.sidebar:
-    st.header("Brand & Logo")
-    logo_file = st.file_uploader(
-        "Upload logo (.svg/.png/.jpg)", type=["svg", "png", "jpg", "jpeg"], key="logo_upload"
+# ---------------- PATRIOT MOBILE–INSPIRED THEME ----------------
+PATRIOT_THEME = {
+    "font_url": "https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&display=swap",
+    "font_stack": "Inter, system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif",
+    "bg": "#FFFFFF",
+    "text": "#0F172A",
+    "muted": "#475569",
+    "primary": "#0B2D52",   # deep navy
+    "accent": "#C8102E",    # patriot red
+    "card": "#FFFFFF",
+    "border": "#E2E8F0",
+    "radius": "12px",
+    "shadow": "0 8px 24px rgba(2, 6, 23, 0.06)",
+}
+
+def apply_theme(t=PATRIOT_THEME):
+    if t.get("font_url"):
+        st.markdown(f'<link rel="stylesheet" href="{t["font_url"]}">', unsafe_allow_html=True)
+
+    css = f"""
+    <style>
+      :root {{
+        --bg: {t["bg"]};
+        --text: {t["text"]};
+        --muted: {t["muted"]};
+        --primary: {t["primary"]};
+        --accent: {t["accent"]};
+        --card: {t["card"]};
+        --border: {t["border"]};
+        --radius: {t["radius"]};
+        --shadow: {t["shadow"]};
+      }}
+
+      html, body, .stApp {{
+        background: var(--bg);
+        color: var(--text);
+        font-family: {t["font_stack"]};
+      }}
+
+      /* Sticky header bar */
+      .pm-header {{
+        position: sticky; top: 0; z-index: 50;
+        background: var(--primary);
+        border-bottom: 1px solid var(--border);
+        padding: 10px 0;
+      }}
+      .pm-wrap {{ width: min(1120px, 92vw); margin: 0 auto; display: flex; align-items: center; gap: 16px; }}
+      .pm-title {{ margin: 0; padding: 0; color: #fff; font: 700 22px/1.2 Inter, system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif; }}
+
+      /* Buttons */
+      .stButton > button {{
+        background: var(--accent);
+        color: #fff;
+        border: 1px solid transparent;
+        border-radius: var(--radius);
+        box-shadow: var(--shadow);
+        font-weight: 600;
+      }}
+      .stButton > button:hover {{ filter: brightness(0.97); }}
+
+      /* Inputs */
+      .stTextInput > div > div input,
+      .stNumberInput input,
+      .stSelectbox > div > div,
+      .stDateInput > div > div,
+      .stTextArea textarea {{
+        border: 1px solid var(--border);
+        border-radius: var(--radius);
+      }}
+
+      /* Tabs */
+      .stTabs [data-baseweb="tab-list"] button[role="tab"] {{
+        background: transparent;
+        color: var(--muted);
+        border-bottom: 2px solid transparent;
+      }}
+      .stTabs [data-baseweb="tab-list"] button[role="tab"][aria-selected="true"] {{
+        color: var(--primary);
+        border-color: var(--primary);
+      }}
+
+      /* Metrics cards */
+      .stMetric {{
+        border: 1px solid var(--border);
+        padding: .75rem;
+        box-shadow: var(--shadow);
+        background: var(--card);
+        border-radius: var(--radius);
+      }}
+
+      /* Dataframes */
+      .stDataFrame, .stTable {{
+        border-radius: var(--radius);
+        box-shadow: var(--shadow);
+      }}
+      .stDataFrame table {{
+        border: 1px solid var(--border);
+        border-radius: var(--radius);
+      }}
+
+      /* Links */
+      a {{ color: var(--primary); }}
+      a:hover {{ color: var(--accent); }}
+
+      /* Section headings with red underline accent */
+      h2 {{ border-bottom: 2px solid var(--accent); padding-bottom: 4px; }}
+    </style>
+    """
+    st.markdown(css, unsafe_allow_html=True)
+
+def render_header(title="Metrics Report"):
+    st.markdown(
+        f'''
+        <div class="pm-header">
+          <div class="pm-wrap">
+            <h1 class="pm-title">{title}</h1>
+          </div>
+        </div>
+        ''',
+        unsafe_allow_html=True
     )
-    logo_url = st.text_input("…or paste a logo URL", placeholder="https://example.com/logo.svg", key="logo_url")
-    st.caption("Tip: SVG preferred. If both are provided, the upload is used.")
 
-def _guess_ext(b: bytes) -> str:
-    if b[:4] == b"\x89PNG": return "png"
-    if b[:3] == b"\xFF\xD8\xFF": return "jpg"
-    head = b[:200].lstrip()
-    if head.startswith(b"<svg") or head.startswith(b"<?xml"): return "svg"
-    return "bin"
+apply_theme()
+render_header("Metrics Report")
+# ---------------- END THEME ----------------
 
-def _fetch_logo_bytes():
-    if logo_file is not None:
-        data = logo_file.read()
-        return data, (_guess_ext(data) or "svg")
-    if logo_url.strip():
-        if not HAS_REQUESTS:
-            st.sidebar.warning("Add 'requests' to requirements.txt to use a logo URL.")
-            return None, None
-        try:
-            r = requests.get(logo_url.strip(), timeout=20)
-            r.raise_for_status()
-            data = r.content
-            return data, _guess_ext(data)
-        except Exception as e:
-            st.sidebar.error(f"Logo URL failed: {e}")
-            return None, None
-    return None, None
-
-def _to_data_uri(b: bytes, ext: str) -> str:
-    if ext == "svg":
-        try:
-            txt = b.decode("utf-8", errors="ignore")
-            return f"data:image/svg+xml;utf8,{txt}"
-        except Exception:
-            pass
-    mime = "image/svg+xml" if ext == "svg" else ("image/png" if ext == "png" else "image/jpeg")
-    return f"data:{mime};base64,{base64.b64encode(b).decode('ascii')}"
-
-logo_bytes, logo_ext = _fetch_logo_bytes()
-if logo_bytes is None:
-    placeholder_svg = f'''<svg xmlns="http://www.w3.org/2000/svg" width="220" height="40" viewBox="0 0 440 80">
-  <rect width="440" height="80" rx="12" fill="{PM_NAVY}"/>
-  <text x="50%" y="52%" dominant-baseline="middle" text-anchor="middle"
-        font-family="Poppins, Arial, sans-serif" font-weight="700" font-size="26" fill="{PM_WHITE}">
-    YOUR LOGO
-  </text>
-</svg>'''
-    logo_bytes = placeholder_svg.encode("utf-8"); logo_ext = "svg"
-logo_data_uri = _to_data_uri(logo_bytes, logo_ext or "svg")
-
-# ================== Light CSS (white title) ==================
-st.markdown(
-    f"""
-<style>
-html, body, .stApp {{
-  background: #ffffff; color: #0B1020;
-}}
-.pm-header {{
-  position: sticky; top: 0; z-index: 10;
-  background: {PM_NAVY}; border-bottom: 1px solid {PM_GRAY}; padding: 10px 0;
-}}
-.pm-wrap {{ width: min(1120px, 92vw); margin: 0 auto; display: flex; align-items: center; gap: 16px; }}
-.pm-logo {{ height: 36px; width: auto; display: block; }}
-.pm-title {{
-  margin: 0; padding: 0; color: {PM_WHITE};
-  font: 700 22px/1.2 Poppins, Inter, system-ui, -apple-system, Segoe UI, Roboto, Arial;
-}}
-h2 {{ border-bottom: 2px solid {PM_RED}; padding-bottom: 4px; }}
-.stButton > button {{
-  background: {PM_RED}; color: {PM_WHITE}; border: 1px solid transparent;
-  border-radius: 10px; padding: 0.5rem 0.9rem; font-weight: 600;
-}}
-.stButton > button:hover {{ filter: brightness(0.95); }}
-</style>
-    """,
-    unsafe_allow_html=True,
-)
-
-# ================== Header ==================
-st.markdown(
-    f"""
-<div class="pm-header">
-  <div class="pm-wrap">
-    <img src="{logo_data_uri}" alt="Logo" class="pm-logo" />
-    <h1 class="pm-title">Metrics Report</h1>
-  </div>
-</div>
-""",
-    unsafe_allow_html=True,
-)
-
-# ================== Helper funcs ==================
+# ================== Generic helpers ==================
 def norm(s: str) -> str:
     return re.sub(r"[^a-z0-9]+", "", str(s).lower())
 
@@ -157,6 +169,7 @@ def idx_or_default(options, value):
     except Exception: return 0
 
 def read_any(uploaded_or_bytes, name_hint: str | None = None):
+    """Read CSV or Excel from file-like, path-like or raw bytes."""
     if isinstance(uploaded_or_bytes, (bytes, bytearray)):
         bio = io.BytesIO(uploaded_or_bytes)
         try:
@@ -271,6 +284,55 @@ def build_excel_bytes(sheets: dict[str, pd.DataFrame]) -> bytes:
     bio.seek(0)
     return bio.read()
 
+# ================== Upload stamping helpers ==================
+UPLOADS_DIR = "./_uploads"
+
+def _sanitize_filename(name: str) -> str:
+    base = os.path.basename(name or "")
+    base = re.sub(r"[^A-Za-z0-9_.-]+", "_", base)
+    return base or "file.csv"
+
+def _ensure_uploads_dir():
+    try:
+        os.makedirs(UPLOADS_DIR, exist_ok=True)
+        return True
+    except Exception:
+        return False
+
+def _uploads_manifest_path():
+    return os.path.join(UPLOADS_DIR, "uploads_manifest.csv")
+
+def _append_upload_manifest(path: str, role: str, nbytes: int):
+    cols = ["path", "role", "bytes", "added_at"]
+    row = {
+        "path": path, "role": role, "bytes": nbytes,
+        "added_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+    }
+    try:
+        if os.path.exists(_uploads_manifest_path()):
+            m = pd.read_csv(_uploads_manifest_path())
+        else:
+            m = pd.DataFrame(columns=cols)
+        m = pd.concat([m, pd.DataFrame([row])], ignore_index=True)
+        m.to_csv(_uploads_manifest_path(), index=False)
+    except Exception:
+        pass
+
+def save_uploaded_copy(raw_bytes: bytes, original_name: str, role: str = "main") -> str | None:
+    """Save a timestamped copy of any loaded file (manual upload / URL / local) to ./_uploads."""
+    if not raw_bytes or not _ensure_uploads_dir():
+        return None
+    ts = time.strftime("%Y%m%d_%H%M%S")
+    safe_name = _sanitize_filename(original_name or f"{role}.csv")
+    out_path = os.path.join(UPLOADS_DIR, f"{ts}_{role}_{safe_name}")
+    try:
+        with open(out_path, "wb") as f:
+            f.write(raw_bytes)
+        _append_upload_manifest(out_path, role, len(raw_bytes))
+        return out_path
+    except Exception:
+        return None
+
 # ================== Auto-refresh ==================
 with st.sidebar:
     st.header("Auto-refresh")
@@ -286,7 +348,7 @@ with st.sidebar:
         st.session_state["_last_refresh_ts"] = time.time()
         (getattr(st, "rerun", None) or st.experimental_rerun)()
 
-# ================== Data Store (historical) ==================
+# ================== Data Store (historical snapshots) ==================
 st.sidebar.header("Data Store (historical)")
 store_dir = st.sidebar.text_input("Store folder", value="./_store", key="store_dir")
 persist_uploads = st.sidebar.checkbox("Persist uploaded/current dataset to store", value=True, key="persist_uploads")
@@ -300,16 +362,23 @@ def ensure_store():
         st.sidebar.error(f"Cannot create store dir: {e}")
         return False
 
-def manifest_path(): return os.path.join(store_dir, "manifest.csv")
+def manifest_path():
+    return os.path.join(store_dir, "manifest.csv")
+
 def load_manifest() -> pd.DataFrame:
     p = manifest_path()
     if os.path.exists(p):
-        try: return pd.read_csv(p)
-        except Exception: return pd.DataFrame(columns=["path","bytes_hash","source","rows","cols","added_at"])
+        try:
+            return pd.read_csv(p)
+        except Exception:
+            return pd.DataFrame(columns=["path","bytes_hash","source","rows","cols","added_at"])
     return pd.DataFrame(columns=["path","bytes_hash","source","rows","cols","added_at"])
+
 def save_manifest(dfm: pd.DataFrame):
-    try: dfm.to_csv(manifest_path(), index=False)
-    except Exception as e: st.sidebar.warning(f"Manifest save failed: {e}")
+    try:
+        dfm.to_csv(manifest_path(), index=False)
+    except Exception as e:
+        st.sidebar.warning(f"Manifest save failed: {e}")
 
 def save_snapshot_bytes(b: bytes, source_label: str = "snapshot") -> tuple[bool, str]:
     if not ensure_store(): return False, "Store not available"
@@ -321,13 +390,16 @@ def save_snapshot_bytes(b: bytes, source_label: str = "snapshot") -> tuple[bool,
     fname = f"{ts}_{h[:8]}.csv"
     path = os.path.join(store_dir, fname)
     try:
-        with open(path, "wb") as f: f.write(b)
+        with open(path, "wb") as f:
+            f.write(b)
         try:
             tmp = pd.read_csv(io.BytesIO(b)); rows, cols = tmp.shape
         except Exception:
             rows, cols = None, None
-        new_row = {"path": path, "bytes_hash": h, "source": source_label,
-                   "rows": rows, "cols": cols, "added_at": time.strftime("%Y-%m-%d %H:%M:%S")}
+        new_row = {
+            "path": path, "bytes_hash": h, "source": source_label,
+            "rows": rows, "cols": cols, "added_at": time.strftime("%Y-%m-%d %H:%M:%S")
+        }
         dfm = pd.concat([dfm, pd.DataFrame([new_row])], ignore_index=True)
         save_manifest(dfm)
         return True, path
@@ -335,32 +407,40 @@ def save_snapshot_bytes(b: bytes, source_label: str = "snapshot") -> tuple[bool,
         return False, f"Save failed: {e}"
 
 def merge_store_csvs(limit: int) -> pd.DataFrame:
+    """Merge up to `limit` most recent CSVs, attaching each file's store timestamp to rows."""
     dfm = load_manifest()
     if dfm.empty: return pd.DataFrame()
     try:
-        dfm["_key"] = pd.to_datetime(dfm["added_at"], errors="coerce"); dfm.sort_values(by=["_key"], inplace=True)
+        dfm["_key"] = pd.to_datetime(dfm["added_at"], errors="coerce")
+        dfm.sort_values(by=["_key"], inplace=True)
     except Exception:
         dfm.sort_values(by=["path"], inplace=True)
+    rows = []
     paths = dfm["path"].dropna().tolist()[-limit:]
-    frames = []
-    for p in paths:
+    addeds = dfm["added_at"].dropna().tolist()[-limit:]
+    for p, added in zip(paths, addeds):
         try:
-            with open(p, "rb") as f: frames.append(pd.read_csv(f))
+            with open(p, "rb") as f:
+                dft = pd.read_csv(f)
+            dft["_STORE_ADDED_AT"] = added  # attach the store timestamp
+            rows.append(dft)
         except Exception:
             continue
-    if not frames: return pd.DataFrame()
-    return pd.concat(frames, ignore_index=True)
+    if not rows: return pd.DataFrame()
+    return pd.concat(rows, ignore_index=True)
 
 col_store_a, col_store_b = st.sidebar.columns(2)
 with col_store_a:
-    if st.button("📄 View manifest", key="view_manifest_btn"):
+    if st.button("📄 View store manifest", key="view_manifest_btn"):
         st.session_state["_show_manifest"] = True
 with col_store_b:
     if st.button("🧹 Clear store", key="clear_store_btn"):
         if ensure_store():
             try:
-                for p in glob.glob(os.path.join(store_dir, "*.csv")): os.remove(p)
-                if os.path.exists(manifest_path()): os.remove(manifest_path())
+                for p in glob.glob(os.path.join(store_dir, "*.csv")):
+                    os.remove(p)
+                if os.path.exists(manifest_path()):
+                    os.remove(manifest_path())
                 st.sidebar.success("Store cleared.")
             except Exception as e:
                 st.sidebar.error(f"Clear failed: {e}")
@@ -368,6 +448,30 @@ with col_store_b:
 if st.session_state.get("_show_manifest"):
     st.subheader("Store Manifest")
     st.dataframe(load_manifest(), use_container_width=True)
+
+# ================== Uploads manifest controls ==================
+st.sidebar.header("Uploads (timestamped copies)")
+c_up_a, c_up_b = st.sidebar.columns(2)
+with c_up_a:
+    if st.button("📄 View uploads manifest", key="view_uploads_manifest_btn"):
+        st.session_state["_show_uploads_manifest"] = True
+with c_up_b:
+    if st.button("🧹 Clear uploads folder", key="clear_uploads_btn"):
+        try:
+            if os.path.isdir(UPLOADS_DIR):
+                for p in glob.glob(os.path.join(UPLOADS_DIR, "*")):
+                    os.remove(p)
+            st.sidebar.success("Uploads folder cleared.")
+        except Exception as e:
+            st.sidebar.error(f"Clear failed: {e}")
+
+if st.session_state.get("_show_uploads_manifest"):
+    st.subheader("Uploads Manifest")
+    try:
+        up = pd.read_csv(_uploads_manifest_path()) if os.path.exists(_uploads_manifest_path()) else pd.DataFrame()
+        st.dataframe(up, use_container_width=True)
+    except Exception as e:
+        st.info(f"No manifest yet or failed to read: {e}")
 
 # ================== Data sources (Main) ==================
 st.sidebar.header("Main Report — Data Source")
@@ -428,7 +532,21 @@ except Exception as e:
 if df is None or df.empty:
     st.warning("The main report appears to be empty."); st.stop()
 
-# Normalize "Abandoned (%rec)" -> "Abandon %"
+# Tag and stamp current df; also create store-based timestamp column for trends
+_ING_TS = time.strftime("%Y-%m-%d %H:%M:%S")
+df["_INGESTED_AT"] = _ING_TS
+df["_STORE_ADDED_AT"] = _ING_TS  # current file uses its ingest time as the trend date
+_saved_main = None
+try:
+    orig_name = source_meta.get("name") or source_meta.get("source") or "main.csv"
+    if raw_bytes:
+        _saved_main = save_uploaded_copy(raw_bytes, orig_name, role="main")
+except Exception:
+    _saved_main = None
+if _saved_main:
+    st.caption(f"Saved uploaded copy: `{_saved_main}`")
+
+# Normalize: "Abandoned (%rec)" -> "Abandon %"
 for c in list(df.columns):
     if norm(c) == norm("Abandoned (%rec)"):
         df.rename(columns={c: "Abandon %"}, inplace=True)
@@ -437,28 +555,7 @@ st.caption(f"Loaded main report from: **{source_meta.get('source','(unknown)')}*
 st.subheader("Preview — Main Report (first 20 rows)")
 st.dataframe(df.head(20), use_container_width=True)
 
-# --------- Snapshot controls ----------
-col_snap_a, col_snap_b = st.columns([1,1])
-with col_snap_a:
-    if st.button("💾 Save snapshot to store", key="save_snapshot_btn"):
-        if persist_uploads:
-            try:
-                if (raw_bytes is None) or (raw_bytes[:4] in [b"%PDF", b"PK\x03\x04"]):
-                    bytes_to_save = df.to_csv(index=False).encode("utf-8")
-                else:
-                    bytes_to_save = raw_bytes
-            except Exception:
-                bytes_to_save = df.to_csv(index=False).encode("utf-8")
-            ok, msg = save_snapshot_bytes(bytes_to_save, source_label=source_meta.get("source","snapshot"))
-            if ok: st.success(f"Snapshot saved: {msg}")
-            else:  st.info(msg)
-        else:
-            st.info("Enable 'Persist uploaded/current dataset to store' in the sidebar.")
-with col_snap_b:
-    if st.button("🔁 Reload store manifest", key="reload_manifest_btn"):
-        st.session_state["_show_manifest"] = True
-
-# ================== Column mapping ==================
+# ================== Column mapping — no date dropdown ==================
 st.subheader("Column Mapping — Main Report")
 SKILL_SYNS  = ["skill", "skill name", "skill group", "group", "queue", "split", "team", "program", "department", "dept", "category", "line of business", "lob"]
 CALLS_SYNS  = ["calls", "total calls", "calls offered", "offered", "inbound calls", "in calls", "total contacts", "contacts", "total interactions", "volume"]
@@ -466,7 +563,6 @@ AGENTS_SYNS = ["agents staffed", "agents", "agent count", "staffed agents", "dis
 AHT_SYNS    = ["aht", "average handle time", "avg handle time", "avg handling time", "avg handle", "aht (s)", "aht (sec)", "talk+hold+acw"]
 ABAND_CNT_SYNS = ["abandoned count", "abandoned", "abandon count", "aband count", "abandoned calls"]
 ABAND_PCT_SYNS = ["abandon %", "abandoned (%rec)", "abandonment rate", "abandon rate"]
-DATE_SYNS   = ["date", "day", "datetime", "date/time", "interval start", "start time", "timestamp", "report date"]
 
 skill_guess     = find_col(df, SKILL_SYNS)
 calls_guess     = find_col(df, CALLS_SYNS)
@@ -474,7 +570,6 @@ agents_guess    = find_col(df, AGENTS_SYNS)
 aht_guess       = find_col(df, AHT_SYNS)
 aband_cnt_guess = find_col(df, ABAND_CNT_SYNS)
 aband_pct_guess = find_col(df, ABAND_PCT_SYNS)
-date_guess      = find_col(df, DATE_SYNS)
 
 cols = list(df.columns)
 skill_col  = st.selectbox("Skill / Group column", cols, index=idx_or_default(cols, skill_guess or cols[0]))
@@ -485,10 +580,12 @@ abandoned_pct_col = st.selectbox("Abandon % column (optional)", ["<none>"] + col
                                  index=idx_or_default(["<none>"]+cols, aband_pct_guess if aband_pct_guess else "<none>"))
 abandoned_count_col = st.selectbox("Abandoned (count) column (optional, used if % is missing)", ["<none>"] + cols,
                                    index=idx_or_default(["<none>"]+cols, aband_cnt_guess if aband_cnt_guess else "<none>"))
-date_col = st.selectbox("Date/Time column (required for trends)", ["<none>"] + cols,
-                        index=idx_or_default(["<none>"]+cols, date_guess if date_guess else "<none>"))
 
-# Fortress → PM Connect rename in skills list
+# Fortress → PM Connect rename in df for consistency
+df[skill_col] = df[skill_col].astype(str).str.strip()
+df.loc[df[skill_col].str.lower() == "fortress", skill_col] = "PM Connect"
+
+# Skills of interest
 default_skills = ["B2B Member Success", "B2B Success Activation", "B2B Success Info", "B2B Success Tech Support",
                   "MS Activation", "MS Info", "MS Loyalty", "MS Tech Support", "PM Connect"]
 skills_list = st.text_area("Skills of interest (one per line)", value="\n".join(default_skills))
@@ -505,31 +602,43 @@ second_source_type = st.sidebar.radio(
     index=0, key="second_source_radio"
 )
 
-def try_fetch_csv_url_simple(url):
-    df_, meta, _ = try_fetch_csv_url(url)
-    return df_, meta
-def load_latest_local_csv_simple(folder, pattern):
-    df_, meta, _ = load_latest_local_csv(folder, pattern)
-    return df_, meta
+def try_fetch_csv_url_second(url):
+    df_, meta, b = try_fetch_csv_url(url); return df_, meta, b
 
-second_df, second_meta = None, {}
+def load_latest_local_csv_second(folder, pattern):
+    df_, meta, b = load_latest_local_csv(folder, pattern); return df_, meta, b
+
+second_df, second_meta, raw2 = None, {}, None
 try:
     if second_source_type == "Public CSV URL":
         url2 = st.sidebar.text_input("2nd CSV URL", os.getenv("SECOND_CSV_URL", ""), key="url2")
-        if url2: second_df, second_meta = try_fetch_csv_url_simple(url2)
+        if url2:
+            second_df, second_meta, raw2 = try_fetch_csv_url_second(url2)
     elif second_source_type == "Local folder (latest *.csv)":
         fold2 = st.sidebar.text_input("2nd local folder", "./data2", key="fold2")
         pat2  = st.sidebar.text_input("2nd filename pattern", "*.csv", key="pat2")
-        second_df, second_meta = load_latest_local_csv_simple(fold2, pat2)
+        second_df, second_meta, raw2 = load_latest_local_csv_second(fold2, pat2)
     else:
         uploaded2 = st.file_uploader("Second report (CSV/XLSX/XLS) — overall totals / no skill filter (optional)",
                                      type=["csv", "xlsx", "xls"], key="second_uploader")
         if uploaded2 is not None:
+            try:
+                raw2 = uploaded2.getvalue()
+            except Exception:
+                raw2 = None
             second_df = read_any(uploaded2)
+            second_meta = {"source": "uploaded file", "name": getattr(uploaded2, "name", "")}
 except Exception as e:
     st.warning(f"Second report load failed: {e}")
 
 if second_df is not None and not second_df.empty:
+    # Stamp 2nd df and save copy (URL/local/manual)
+    second_df["_INGESTED_AT"] = time.strftime("%Y-%m-%d %H:%M:%S")
+    second_df["_STORE_ADDED_AT"] = second_df["_INGESTED_AT"]
+    if raw2:
+        _saved_second = save_uploaded_copy(raw2, second_meta.get("name") or second_meta.get("source") or "second.csv", role="second")
+        if _saved_second:
+            st.caption(f"Saved uploaded copy (2nd): `{_saved_second}`")
     for c in list(second_df.columns):
         if norm(c) == norm("Abandoned (%rec)"):
             second_df.rename(columns={c: "Abandon %"}, inplace=True)
@@ -537,14 +646,6 @@ if second_df is not None and not second_df.empty:
     st.dataframe(second_df.head(10), use_container_width=True)
 
 # ================== Core calculations ==================
-for c in [skill_col, calls_col, agents_col, aht_col]:
-    if c not in df.columns:
-        st.error(f"Selected column not found: {c}")
-        st.stop()
-
-df[skill_col] = df[skill_col].astype(str).str.strip()
-df.loc[df[skill_col].str.lower() == "fortress", skill_col] = "PM Connect"
-
 calls_num  = pd.to_numeric(df[calls_col],  errors="coerce").fillna(0)
 agents_num = pd.to_numeric(df[agents_col], errors="coerce").fillna(0)
 
@@ -562,14 +663,14 @@ calls_label = "Total Calls (from main report)"
 agents_label = "Agents Staffed (sum of per-skill)"
 
 # --- Override from SECOND report when available ---
-CALLS_SYNS  = ["calls", "total calls", "calls offered", "offered", "inbound calls", "contacts", "total contacts", "volume"]
+CALLS_SYNS_ALL  = ["calls", "total calls", "calls offered", "offered", "inbound calls", "contacts", "total contacts", "volume"]
 if second_df is not None and not second_df.empty:
     AGENTS_SYNS_MINI = ["agents staffed", "agents", "agent count", "distinct", "unique"]
     agents2_guess = find_col(second_df, AGENTS_SYNS_MINI) or next((c for c in second_df.columns if "agent" in c.lower()), None)
     if agents2_guess:
         total_agents = int(pd.to_numeric(second_df[agents2_guess], errors="coerce").fillna(0).sum())
         agents_label = "Agents Staffed (from 2nd report)"
-    calls2_guess = find_col(second_df, CALLS_SYNS) or next((c for c in second_df.columns if "call" in c.lower() or "offered" in c.lower() or "contact" in c.lower()), None)
+    calls2_guess = find_col(second_df, CALLS_SYNS_ALL) or next((c for c in second_df.columns if "call" in c.lower() or "offered" in c.lower() or "contact" in c.lower()), None)
     if calls2_guess:
         total_calls = int(pd.to_numeric(second_df[calls2_guess], errors="coerce").fillna(0).sum())
         calls_label = "Total Calls (from 2nd report)"
@@ -591,11 +692,11 @@ by_skill_core = pd.DataFrame({
 })
 by_skill_core["Abandon %"] = (rates.round(2).astype(str) + "%") if rates is not None else "N/A"
 
-# ================== Historical merge selection ==================
+# ================== Historical dataset selection ==================
 st.markdown("---")
 st.header("📦 Historical Dataset")
 dataset_scope = st.radio(
-    "Use which data for TREND charts?", 
+    "Use which data for TREND charts?",
     ("Current file only", "Merged historical store", "Current + historical"),
     index=1, key="dataset_scope_radio"
 )
@@ -617,12 +718,33 @@ else:
     if historical_df.empty:
         analysis_df = df.copy()
     else:
-        common_cols = [c for c in df.columns if c in historical_df.columns]
-        if not common_cols:
-            st.warning("Historical files have a different schema. Using current file for trends.")
-            analysis_df = df.copy()
+        # UNION of columns so the store date column stays present
+        union_cols = sorted(set(df.columns).union(set(historical_df.columns)))
+        analysis_df = pd.concat(
+            [historical_df.reindex(columns=union_cols), df.reindex(columns=union_cols)],
+            ignore_index=True,
+        )
+
+# ================== Save snapshot button ==================
+col_snap_a, col_snap_b = st.columns([1,1])
+with col_snap_a:
+    if st.button("💾 Save snapshot to store", key="save_snapshot_btn"):
+        if persist_uploads:
+            try:
+                if (raw_bytes is None) or (raw_bytes[:4] in [b"%PDF", b"PK\x03\x04"]):
+                    bytes_to_save = df.to_csv(index=False).encode("utf-8")
+                else:
+                    bytes_to_save = raw_bytes
+            except Exception:
+                bytes_to_save = df.to_csv(index=False).encode("utf-8")
+            ok, msg = save_snapshot_bytes(bytes_to_save, source_label=source_meta.get("source","snapshot"))
+            if ok: st.success(f"Snapshot saved: {msg}")
+            else:  st.info(msg)
         else:
-            analysis_df = pd.concat([historical_df[common_cols], df[common_cols]], ignore_index=True)
+            st.info("Enable 'Persist uploaded/current dataset to store' in the sidebar.")
+with col_snap_b:
+    if st.button("🔁 Reload store manifest", key="reload_manifest_btn"):
+        st.session_state["_show_manifest"] = True
 
 # ================== Filled Report (Core) ==================
 md = io.StringIO()
@@ -680,26 +802,31 @@ st.download_button("⬇️ Download report (Markdown)", data=report_md.encode("u
 st.subheader("By-Skill Table — Core Fields")
 st.dataframe(by_skill_core, use_container_width=True)
 
-# ================== Skill Trends (uses analysis_df) ==================
+# ================== Skill Trends (using store timestamp) ==================
 st.markdown("---")
 st.header("📈 Skill Trends — AHT & Abandon % (Daily / Weekly / Monthly)")
+st.caption("Trend dates = when each CSV snapshot was saved to the store (or the current file's ingest time).")
 
-if date_col == "<none>":
-    st.info("Pick a **Date/Time column** above to enable trend charts.")
+trend_df = analysis_df.copy()
+if "_STORE_ADDED_AT" not in trend_df.columns:
+    trend_df["_STORE_ADDED_AT"] = _ING_TS
+
+# Normalize skills
+if skill_col in trend_df.columns:
+    trend_df[skill_col] = trend_df[skill_col].astype(str).str.strip()
+    trend_df.loc[trend_df[skill_col].str.lower() == "fortress", skill_col] = "PM Connect"
+
+trend_df["_AHT_sec"] = trend_df[aht_col].apply(parse_duration_to_seconds) if aht_col in trend_df.columns else np.nan
+trend_df = add_time_columns(trend_df, "_STORE_ADDED_AT")
+
+rate_series = None
+if abandoned_pct_col != "<none>" and abandoned_pct_col in trend_df.columns:
+    rate_series = to_percent(trend_df[abandoned_pct_col])
+aband_count_col_final_for_trend = abandoned_count_col if (abandoned_count_col != "<none>" and abandoned_count_col in trend_df.columns) else None
+
+if skill_col not in trend_df.columns or calls_col not in trend_df.columns:
+    st.info("Trends need at least the Skill and Calls columns present in the merged dataset.")
 else:
-    trend_df = analysis_df.copy()
-    if skill_col in trend_df.columns:
-        trend_df[skill_col] = trend_df[skill_col].astype(str).str.strip()
-        trend_df.loc[trend_df[skill_col].str.lower() == "fortress", skill_col] = "PM Connect"
-
-    trend_df["_AHT_sec"] = trend_df[aht_col].apply(parse_duration_to_seconds) if aht_col in trend_df.columns else np.nan
-    trend_df = add_time_columns(trend_df, date_col)
-
-    rate_series = None
-    if abandoned_pct_col != "<none>" and abandoned_pct_col in trend_df.columns:
-        rate_series = to_percent(trend_df[abandoned_pct_col])
-    aband_count_col_final_for_trend = abandoned_count_col if (abandoned_count_col != "<none>" and abandoned_count_col in trend_df.columns) else None
-
     daily_all   = aggregate_by_period_all_skills(trend_df, skill_col, calls_col, "_AHT_sec", rate_series, aband_count_col_final_for_trend, "_DATE")
     weekly_all  = aggregate_by_period_all_skills(trend_df, skill_col, calls_col, "_AHT_sec", rate_series, aband_count_col_final_for_trend, "_WEEK_START")
     monthly_all = aggregate_by_period_all_skills(trend_df, skill_col, calls_col, "_AHT_sec", rate_series, aband_count_col_final_for_trend, "_MONTH_START")
@@ -739,7 +866,7 @@ else:
             st.metric("Last Abandon % (Weekly)", f"{weekly['Abandon %'].iloc[-1]:.2f}%" if (not weekly.empty and pd.notna(weekly['Abandon %'].iloc[-1])) else "N/A",
                       delta=delta_str(weekly["Abandon %"]) if not weekly.empty else "—")
 
-        # ---------- chart helpers (Altair or Streamlit) ----------
+        # ---------- chart helpers ----------
         def alt_line_chart(df_in: pd.DataFrame, y_col: str, y_title: str):
             df_plot = df_in.copy()
             df_plot[y_col] = pd.to_numeric(df_plot[y_col], errors="coerce")
@@ -774,7 +901,7 @@ else:
             if HAS_ALTAIR: alt_line_chart(df_in, y_col, y_title)
             else:          st_line_chart(df_in, y_col, y_title)
 
-        # -------- Single-skill charts (FIX: no renaming / no duplicate columns) --------
+        # -------- Single-skill charts --------
         st.subheader(f"Daily — {skill_choice}")
         c1, c2 = st.columns(2)
         with c1: line_chart(daily, "AHT_sec", "AHT (seconds)")
@@ -839,7 +966,7 @@ else:
         if multi:
             d_daily   = daily_all[daily_all["Skill"].isin(multi)].copy()
             d_weekly  = weekly_all[weekly_all["Skill"].isin(multi)].copy()
-            d_monthly = monthly_all[monthly_all["Skill"].isin(multi)].copy()
+            d_monthly = monthly_all[daily_all["Skill"].isin(multi)].copy() if False else monthly_all[monthly_all["Skill"].isin(multi)].copy()
 
             st.subheader("Daily compare")
             oc1, oc2 = st.columns(2)
