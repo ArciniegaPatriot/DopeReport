@@ -1,10 +1,7 @@
-# app.py — Metrics Report with Historical Data Store (uploads persisted for trends)
-# Key features added:
-# - Persist each uploaded/loaded dataset to ./_store (or a path you choose)
-# - Manifest with content-hash dedup; view/clear controls
-# - Use "Current file", "Merged historical store", or "Current + historical" for trends
+# app.py — Metrics Report with Historical Store + Altair duplicate-column fix
+# Works well with Python 3.12 (use runtime.txt "python-3.12")
 #
-# Requirements (requirements.txt):
+# requirements.txt (recommended):
 # streamlit==1.36.0
 # pandas==2.2.2
 # numpy==1.26.4
@@ -14,7 +11,7 @@
 # requests==2.32.3
 # python-docx==1.1.2
 # reportlab==4.2.2
-# fpdf2==2.7.9  # fallback PDF if ReportLab wheels not available (optional)
+# fpdf2==2.7.9
 
 import os, io, re, glob, time, base64, json, hashlib
 import numpy as np
@@ -139,7 +136,7 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-# ================== Helper funcs for the report ==================
+# ================== Helper funcs ==================
 def norm(s: str) -> str:
     return re.sub(r"[^a-z0-9]+", "", str(s).lower())
 
@@ -289,9 +286,8 @@ with st.sidebar:
         st.session_state["_last_refresh_ts"] = time.time()
         (getattr(st, "rerun", None) or st.experimental_rerun)()
 
-# ================== Data Store (NEW) ==================
+# ================== Data Store (historical) ==================
 st.sidebar.header("Data Store (historical)")
-
 store_dir = st.sidebar.text_input("Store folder", value="./_store", key="store_dir")
 persist_uploads = st.sidebar.checkbox("Persist uploaded/current dataset to store", value=True, key="persist_uploads")
 max_merge = st.sidebar.slider("Max files to merge for trends", min_value=5, max_value=500, value=100, step=5, key="max_merge")
@@ -304,23 +300,16 @@ def ensure_store():
         st.sidebar.error(f"Cannot create store dir: {e}")
         return False
 
-def manifest_path():
-    return os.path.join(store_dir, "manifest.csv")
-
+def manifest_path(): return os.path.join(store_dir, "manifest.csv")
 def load_manifest() -> pd.DataFrame:
     p = manifest_path()
     if os.path.exists(p):
-        try:
-            return pd.read_csv(p)
-        except Exception:
-            return pd.DataFrame(columns=["path","bytes_hash","source","rows","cols","added_at"])
+        try: return pd.read_csv(p)
+        except Exception: return pd.DataFrame(columns=["path","bytes_hash","source","rows","cols","added_at"])
     return pd.DataFrame(columns=["path","bytes_hash","source","rows","cols","added_at"])
-
 def save_manifest(dfm: pd.DataFrame):
-    try:
-        dfm.to_csv(manifest_path(), index=False)
-    except Exception as e:
-        st.sidebar.warning(f"Manifest save failed: {e}")
+    try: dfm.to_csv(manifest_path(), index=False)
+    except Exception as e: st.sidebar.warning(f"Manifest save failed: {e}")
 
 def save_snapshot_bytes(b: bytes, source_label: str = "snapshot") -> tuple[bool, str]:
     if not ensure_store(): return False, "Store not available"
@@ -332,18 +321,13 @@ def save_snapshot_bytes(b: bytes, source_label: str = "snapshot") -> tuple[bool,
     fname = f"{ts}_{h[:8]}.csv"
     path = os.path.join(store_dir, fname)
     try:
-        with open(path, "wb") as f:
-            f.write(b)
-        # record metadata
+        with open(path, "wb") as f: f.write(b)
         try:
-            tmp = pd.read_csv(io.BytesIO(b))
-            rows, cols = tmp.shape
+            tmp = pd.read_csv(io.BytesIO(b)); rows, cols = tmp.shape
         except Exception:
             rows, cols = None, None
-        new_row = {
-            "path": path, "bytes_hash": h, "source": source_label,
-            "rows": rows, "cols": cols, "added_at": time.strftime("%Y-%m-%d %H:%M:%S")
-        }
+        new_row = {"path": path, "bytes_hash": h, "source": source_label,
+                   "rows": rows, "cols": cols, "added_at": time.strftime("%Y-%m-%d %H:%M:%S")}
         dfm = pd.concat([dfm, pd.DataFrame([new_row])], ignore_index=True)
         save_manifest(dfm)
         return True, path
@@ -351,28 +335,20 @@ def save_snapshot_bytes(b: bytes, source_label: str = "snapshot") -> tuple[bool,
         return False, f"Save failed: {e}"
 
 def merge_store_csvs(limit: int) -> pd.DataFrame:
-    """Load up to `limit` most recent CSVs in store and concat."""
     dfm = load_manifest()
-    if dfm.empty:
-        return pd.DataFrame()
-    # sort by added_at if present else by path
+    if dfm.empty: return pd.DataFrame()
     try:
-        dfm["_key"] = pd.to_datetime(dfm["added_at"], errors="coerce")
-        dfm.sort_values(by=["_key"], inplace=True)
+        dfm["_key"] = pd.to_datetime(dfm["added_at"], errors="coerce"); dfm.sort_values(by=["_key"], inplace=True)
     except Exception:
         dfm.sort_values(by=["path"], inplace=True)
-    paths = dfm["path"].dropna().tolist()
-    # keep last `limit`
-    paths = paths[-limit:]
+    paths = dfm["path"].dropna().tolist()[-limit:]
     frames = []
     for p in paths:
         try:
-            with open(p, "rb") as f:
-                frames.append(pd.read_csv(f))
+            with open(p, "rb") as f: frames.append(pd.read_csv(f))
         except Exception:
             continue
-    if not frames:
-        return pd.DataFrame()
+    if not frames: return pd.DataFrame()
     return pd.concat(frames, ignore_index=True)
 
 col_store_a, col_store_b = st.sidebar.columns(2)
@@ -382,12 +358,9 @@ with col_store_a:
 with col_store_b:
     if st.button("🧹 Clear store", key="clear_store_btn"):
         if ensure_store():
-            # remove files + manifest
             try:
-                for p in glob.glob(os.path.join(store_dir, "*.csv")):
-                    os.remove(p)
-                if os.path.exists(manifest_path()):
-                    os.remove(manifest_path())
+                for p in glob.glob(os.path.join(store_dir, "*.csv")): os.remove(p)
+                if os.path.exists(manifest_path()): os.remove(manifest_path())
                 st.sidebar.success("Store cleared.")
             except Exception as e:
                 st.sidebar.error(f"Clear failed: {e}")
@@ -425,8 +398,7 @@ def load_latest_local_csv(folder: str, pattern: str = "*.csv") -> tuple[pd.DataF
         paths = sorted(glob.glob(os.path.join(folder, pattern)), key=lambda p: os.path.getmtime(p))
         if not paths: return None, {"error": f"No files matching {pattern} in {folder}"}, None
         latest = paths[-1]
-        with open(latest, "rb") as f:
-            b = f.read()
+        with open(latest, "rb") as f: b = f.read()
         df_ = read_any(io.BytesIO(b), name_hint=latest)
         return df_, {"source": latest, "mtime": os.path.getmtime(latest)}, b
     except Exception as e:
@@ -445,7 +417,6 @@ try:
         if uploaded is None:
             st.info("Upload the main CSV/Excel file, or choose another source in the sidebar.")
             st.stop()
-        # keep a copy of bytes for store (if CSV; else snapshot via df.to_csv)
         try:
             raw_bytes = uploaded.getvalue()
         except Exception:
@@ -457,7 +428,7 @@ except Exception as e:
 if df is None or df.empty:
     st.warning("The main report appears to be empty."); st.stop()
 
-# Normalize abandoned column label
+# Normalize "Abandoned (%rec)" -> "Abandon %"
 for c in list(df.columns):
     if norm(c) == norm("Abandoned (%rec)"):
         df.rename(columns={c: "Abandon %"}, inplace=True)
@@ -471,13 +442,11 @@ col_snap_a, col_snap_b = st.columns([1,1])
 with col_snap_a:
     if st.button("💾 Save snapshot to store", key="save_snapshot_btn"):
         if persist_uploads:
-            # prefer raw_bytes if it's a CSV; else use df.to_csv
-            bytes_to_save = raw_bytes
-            # If raw_bytes unavailable or not CSVish, make a CSV snapshot
             try:
-                # simple CSV sniff: if bytes start with %PDF or PK or XLS sig, we fallback to df.to_csv
-                if (bytes_to_save is None) or (bytes_to_save[:4] in [b"%PDF", b"PK\x03\x04"]):
+                if (raw_bytes is None) or (raw_bytes[:4] in [b"%PDF", b"PK\x03\x04"]):
                     bytes_to_save = df.to_csv(index=False).encode("utf-8")
+                else:
+                    bytes_to_save = raw_bytes
             except Exception:
                 bytes_to_save = df.to_csv(index=False).encode("utf-8")
             ok, msg = save_snapshot_bytes(bytes_to_save, source_label=source_meta.get("source","snapshot"))
@@ -535,11 +504,12 @@ second_source_type = st.sidebar.radio(
     "Choose source", ["Manual upload", "Public CSV URL", "Local folder (latest *.csv)"],
     index=0, key="second_source_radio"
 )
+
 def try_fetch_csv_url_simple(url):
-    df_, meta, b = try_fetch_csv_url(url)
+    df_, meta, _ = try_fetch_csv_url(url)
     return df_, meta
 def load_latest_local_csv_simple(folder, pattern):
-    df_, meta, b = load_latest_local_csv(folder, pattern)
+    df_, meta, _ = load_latest_local_csv(folder, pattern)
     return df_, meta
 
 second_df, second_meta = None, {}
@@ -621,7 +591,7 @@ by_skill_core = pd.DataFrame({
 })
 by_skill_core["Abandon %"] = (rates.round(2).astype(str) + "%") if rates is not None else "N/A"
 
-# ================== Store merge for Trends (NEW) ==================
+# ================== Historical merge selection ==================
 st.markdown("---")
 st.header("📦 Historical Dataset")
 dataset_scope = st.radio(
@@ -639,16 +609,14 @@ if dataset_scope != "Current file only":
         st.success(f"Merged historical files: {len(historical_df)} rows")
         st.dataframe(historical_df.head(10), use_container_width=True)
 
-# Pick analysis_df for trends
 if dataset_scope == "Current file only":
     analysis_df = df.copy()
 elif dataset_scope == "Merged historical store":
     analysis_df = historical_df.copy() if not historical_df.empty else df.copy()
-else:  # Current + historical
+else:
     if historical_df.empty:
         analysis_df = df.copy()
     else:
-        # Align columns for safe concat
         common_cols = [c for c in df.columns if c in historical_df.columns]
         if not common_cols:
             st.warning("Historical files have a different schema. Using current file for trends.")
@@ -720,13 +688,10 @@ if date_col == "<none>":
     st.info("Pick a **Date/Time column** above to enable trend charts.")
 else:
     trend_df = analysis_df.copy()
-    # normalize skill rename if present
     if skill_col in trend_df.columns:
         trend_df[skill_col] = trend_df[skill_col].astype(str).str.strip()
         trend_df.loc[trend_df[skill_col].str.lower() == "fortress", skill_col] = "PM Connect"
 
-    # prepare numeric series from the *current file* mapping names
-    # If columns are missing in historical, they'll be NaN and safely skipped in aggregates
     trend_df["_AHT_sec"] = trend_df[aht_col].apply(parse_duration_to_seconds) if aht_col in trend_df.columns else np.nan
     trend_df = add_time_columns(trend_df, date_col)
 
@@ -774,9 +739,12 @@ else:
             st.metric("Last Abandon % (Weekly)", f"{weekly['Abandon %'].iloc[-1]:.2f}%" if (not weekly.empty and pd.notna(weekly['Abandon %'].iloc[-1])) else "N/A",
                       delta=delta_str(weekly["Abandon %"]) if not weekly.empty else "—")
 
+        # ---------- chart helpers (Altair or Streamlit) ----------
         def alt_line_chart(df_in: pd.DataFrame, y_col: str, y_title: str):
+            df_plot = df_in.copy()
+            df_plot[y_col] = pd.to_numeric(df_plot[y_col], errors="coerce")
             chart = (
-                alt.Chart(df_in)
+                alt.Chart(df_plot)
                 .mark_line(point=True)
                 .encode(
                     x=alt.X("period:T", title="Period"),
@@ -793,9 +761,12 @@ else:
             st.altair_chart(chart, use_container_width=True)
 
         def st_line_chart(df_in: pd.DataFrame, y_col: str, y_title: str):
-            if df_in.empty: st.info("No data available."); return
+            if df_in.empty:
+                st.info("No data available."); return
+            df_plot = df_in.copy()
+            df_plot[y_col] = pd.to_numeric(df_plot[y_col], errors="coerce")
             st.write(y_title)
-            t = df_in[["period", y_col]].set_index("period")
+            t = df_plot[["period", y_col]].set_index("period")
             st.line_chart(t)
 
         def line_chart(df_in: pd.DataFrame, y_col: str, y_title: str):
@@ -803,31 +774,23 @@ else:
             if HAS_ALTAIR: alt_line_chart(df_in, y_col, y_title)
             else:          st_line_chart(df_in, y_col, y_title)
 
+        # -------- Single-skill charts (FIX: no renaming / no duplicate columns) --------
         st.subheader(f"Daily — {skill_choice}")
         c1, c2 = st.columns(2)
-        with c1:
-            t = daily.copy(); t["AHT_numeric"] = t["AHT_sec"]
-            line_chart(t.rename(columns={"AHT_numeric": "AHT_sec"}), "AHT_sec", "AHT (seconds)")
-        with c2:
-            line_chart(daily, "Abandon %", "Abandon %")
+        with c1: line_chart(daily, "AHT_sec", "AHT (seconds)")
+        with c2: line_chart(daily, "Abandon %", "Abandon %")
         st.dataframe(daily.assign(**{"Abandon %": daily["Abandon %"].round(2)}), use_container_width=True)
 
         st.subheader(f"Weekly — {skill_choice}")
         c3, c4 = st.columns(2)
-        with c3:
-            t = weekly.copy(); t["AHT_numeric"] = t["AHT_sec"]
-            line_chart(t.rename(columns={"AHT_numeric": "AHT_sec"}), "AHT_sec", "AHT (seconds)")
-        with c4:
-            line_chart(weekly, "Abandon %", "Abandon %")
+        with c3: line_chart(weekly, "AHT_sec", "AHT (seconds)")
+        with c4: line_chart(weekly, "Abandon %", "Abandon %")
         st.dataframe(weekly.assign(**{"Abandon %": weekly["Abandon %"].round(2)}), use_container_width=True)
 
         st.subheader(f"Monthly — {skill_choice}")
         c5, c6 = st.columns(2)
-        with c5:
-            t = monthly.copy(); t["AHT_numeric"] = t["AHT_sec"]
-            line_chart(t.rename(columns={"AHT_numeric": "AHT_sec"}), "AHT_sec", "AHT (seconds)")
-        with c6:
-            line_chart(monthly, "Abandon %", "Abandon %")
+        with c5: line_chart(monthly, "AHT_sec", "AHT (seconds)")
+        with c6: line_chart(monthly, "Abandon %", "Abandon %")
         st.dataframe(monthly.assign(**{"Abandon %": monthly["Abandon %"].round(2)}), use_container_width=True)
 
         # ---------- Multi-skill compare ----------
@@ -839,8 +802,10 @@ else:
         multi = st.multiselect("Select skills to compare", all_skills_sorted2, default=default_preselect, key="multi_skills_select")
 
         def overlay_alt(df_in: pd.DataFrame, y_col: str, title: str):
+            df_plot = df_in.copy()
+            df_plot[y_col] = pd.to_numeric(df_plot[y_col], errors="coerce")
             chart = (
-                alt.Chart(df_in)
+                alt.Chart(df_plot)
                 .mark_line(point=True)
                 .encode(
                     x=alt.X("period:T", title="Period"),
@@ -861,7 +826,9 @@ else:
         def overlay_st(df_in: pd.DataFrame, y_col: str, title: str):
             st.write(title)
             if df_in.empty: st.info("No data for the selected skills."); return
-            p = df_in.pivot_table(index="period", columns="Skill", values=y_col, aggfunc="mean")
+            df_plot = df_in.copy()
+            df_plot[y_col] = pd.to_numeric(df_plot[y_col], errors="coerce")
+            p = df_plot.pivot_table(index="period", columns="Skill", values=y_col, aggfunc="mean")
             st.line_chart(p)
 
         def overlay_chart(df_in: pd.DataFrame, y_col: str, title: str):
@@ -876,32 +843,23 @@ else:
 
             st.subheader("Daily compare")
             oc1, oc2 = st.columns(2)
-            with oc1:
-                t = d_daily.copy(); t["AHT_numeric"] = t["AHT_sec"]
-                overlay_chart(t.rename(columns={"AHT_numeric":"AHT_sec"}), "AHT_sec", "AHT (seconds)")
-            with oc2:
-                overlay_chart(d_daily, "Abandon %", "Abandon %")
+            with oc1: overlay_chart(d_daily, "AHT_sec", "AHT (seconds)")
+            with oc2: overlay_chart(d_daily, "Abandon %", "Abandon %")
             st.dataframe(d_daily.assign(**{"Abandon %": d_daily["Abandon %"].round(2)}), use_container_width=True)
 
             st.subheader("Weekly compare")
             oc3, oc4 = st.columns(2)
-            with oc3:
-                t = d_weekly.copy(); t["AHT_numeric"] = t["AHT_sec"]
-                overlay_chart(t.rename(columns={"AHT_numeric":"AHT_sec"}), "AHT_sec", "AHT (seconds)")
-            with oc4:
-                overlay_chart(d_weekly, "Abandon %", "Abandon %")
+            with oc3: overlay_chart(d_weekly, "AHT_sec", "AHT (seconds)")
+            with oc4: overlay_chart(d_weekly, "Abandon %", "Abandon %")
             st.dataframe(d_weekly.assign(**{"Abandon %": d_weekly["Abandon %"].round(2)}), use_container_width=True)
 
             st.subheader("Monthly compare")
             oc5, oc6 = st.columns(2)
-            with oc5:
-                t = d_monthly.copy(); t["AHT_numeric"] = t["AHT_sec"]
-                overlay_chart(t.rename(columns={"AHT_numeric":"AHT_sec"}), "AHT_sec", "AHT (seconds)")
-            with oc6:
-                overlay_chart(d_monthly, "Abandon %", "Abandon %")
+            with oc5: overlay_chart(d_monthly, "AHT_sec", "AHT (seconds)")
+            with oc6: overlay_chart(d_monthly, "Abandon %", "Abandon %")
             st.dataframe(d_monthly.assign(**{"Abandon %": d_monthly["Abandon %"].round(2)}), use_container_width=True)
 
-# ================== Optional Word/PDF exports ==================
+# ================== Word/PDF exports ==================
 try:
     from docx import Document
     def build_docx(md_text):
