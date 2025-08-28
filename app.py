@@ -1,17 +1,22 @@
-# app.py — Metrics Report (Patriot-inspired header + full KPI tooling)
-# Requirements (add to requirements.txt):
+# app.py — Metrics Report with Historical Data Store (uploads persisted for trends)
+# Key features added:
+# - Persist each uploaded/loaded dataset to ./_store (or a path you choose)
+# - Manifest with content-hash dedup; view/clear controls
+# - Use "Current file", "Merged historical store", or "Current + historical" for trends
+#
+# Requirements (requirements.txt):
 # streamlit==1.36.0
 # pandas==2.2.2
 # numpy==1.26.4
-# altair==5.2.0        # optional but recommended
+# altair==5.2.0
 # openpyxl==3.1.5
 # xlrd==2.0.1
 # requests==2.32.3
-# python-docx==1.1.2   # optional
-# reportlab==4.2.2     # optional
+# python-docx==1.1.2
+# reportlab==4.2.2
+# fpdf2==2.7.9  # fallback PDF if ReportLab wheels not available (optional)
 
-import os, io, re, glob, time, base64
-from datetime import date
+import os, io, re, glob, time, base64, json, hashlib
 import numpy as np
 import pandas as pd
 import streamlit as st
@@ -90,9 +95,7 @@ if logo_bytes is None:
     YOUR LOGO
   </text>
 </svg>'''
-    logo_bytes = placeholder_svg.encode("utf-8")
-    logo_ext = "svg"
-
+    logo_bytes = placeholder_svg.encode("utf-8"); logo_ext = "svg"
 logo_data_uri = _to_data_uri(logo_bytes, logo_ext or "svg")
 
 # ================== Light CSS (white title) ==================
@@ -100,23 +103,16 @@ st.markdown(
     f"""
 <style>
 html, body, .stApp {{
-  background: #ffffff;
-  color: #0B1020;
+  background: #ffffff; color: #0B1020;
 }}
 .pm-header {{
   position: sticky; top: 0; z-index: 10;
-  background: {PM_NAVY};
-  border-bottom: 1px solid {PM_GRAY};
-  padding: 10px 0;
+  background: {PM_NAVY}; border-bottom: 1px solid {PM_GRAY}; padding: 10px 0;
 }}
-.pm-wrap {{
-  width: min(1120px, 92vw); margin: 0 auto;
-  display: flex; align-items: center; gap: 16px;
-}}
+.pm-wrap {{ width: min(1120px, 92vw); margin: 0 auto; display: flex; align-items: center; gap: 16px; }}
 .pm-logo {{ height: 36px; width: auto; display: block; }}
 .pm-title {{
-  margin: 0; padding: 0;
-  color: {PM_WHITE}; /* Title in white */
+  margin: 0; padding: 0; color: {PM_WHITE};
   font: 700 22px/1.2 Poppins, Inter, system-ui, -apple-system, Segoe UI, Roboto, Arial;
 }}
 h2 {{ border-bottom: 2px solid {PM_RED}; padding-bottom: 4px; }}
@@ -191,35 +187,10 @@ def to_percent(series_like):
         vals = vals * 100.0
     return vals
 
-def try_fetch_csv_url(url: str) -> tuple[pd.DataFrame | None, dict]:
-    if not HAS_REQUESTS:
-        return None, {"error": "Package 'requests' not installed. Add it to requirements.txt"}
-    if not url:
-        return None, {"error": "No URL provided"}
-    try:
-        r = requests.get(url, timeout=45)
-        if r.status_code >= 300:
-            return None, {"error": f"{r.status_code}: {r.text[:300]}", "source": url}
-        return read_any(r.content, name_hint=url), {"source": url, "bytes": len(r.content)}
-    except Exception as e:
-        return None, {"error": str(e), "source": url}
-
-def load_latest_local_csv(folder: str, pattern: str = "*.csv") -> tuple[pd.DataFrame | None, dict]:
-    try:
-        paths = sorted(glob.glob(os.path.join(folder, pattern)), key=lambda p: os.path.getmtime(p))
-        if not paths: return None, {"error": f"No files matching {pattern} in {folder}"}
-        latest = paths[-1]
-        with open(latest, "rb") as f:
-            df = read_any(f, name_hint=latest)
-        return df, {"source": latest, "mtime": os.path.getmtime(latest)}
-    except Exception as e:
-        return None, {"error": str(e)}
-
 def parse_duration_to_seconds(x) -> float:
     if pd.isna(x): return np.nan
     s = str(x).strip()
-    if re.fullmatch(r"^-?\d+(\.\d+)?$", s):
-        return float(s)
+    if re.fullmatch(r"^-?\d+(\.\d+)?$", s): return float(s)
     if ":" in s:
         try:
             parts = [float(p) for p in s.split(":")]
@@ -318,40 +289,175 @@ with st.sidebar:
         st.session_state["_last_refresh_ts"] = time.time()
         (getattr(st, "rerun", None) or st.experimental_rerun)()
 
-# ================== Data sources (with unique keys) ==================
+# ================== Data Store (NEW) ==================
+st.sidebar.header("Data Store (historical)")
+
+store_dir = st.sidebar.text_input("Store folder", value="./_store", key="store_dir")
+persist_uploads = st.sidebar.checkbox("Persist uploaded/current dataset to store", value=True, key="persist_uploads")
+max_merge = st.sidebar.slider("Max files to merge for trends", min_value=5, max_value=500, value=100, step=5, key="max_merge")
+
+def ensure_store():
+    try:
+        os.makedirs(store_dir, exist_ok=True)
+        return True
+    except Exception as e:
+        st.sidebar.error(f"Cannot create store dir: {e}")
+        return False
+
+def manifest_path():
+    return os.path.join(store_dir, "manifest.csv")
+
+def load_manifest() -> pd.DataFrame:
+    p = manifest_path()
+    if os.path.exists(p):
+        try:
+            return pd.read_csv(p)
+        except Exception:
+            return pd.DataFrame(columns=["path","bytes_hash","source","rows","cols","added_at"])
+    return pd.DataFrame(columns=["path","bytes_hash","source","rows","cols","added_at"])
+
+def save_manifest(dfm: pd.DataFrame):
+    try:
+        dfm.to_csv(manifest_path(), index=False)
+    except Exception as e:
+        st.sidebar.warning(f"Manifest save failed: {e}")
+
+def save_snapshot_bytes(b: bytes, source_label: str = "snapshot") -> tuple[bool, str]:
+    if not ensure_store(): return False, "Store not available"
+    h = hashlib.sha256(b).hexdigest()
+    dfm = load_manifest()
+    if (dfm["bytes_hash"] == h).any():
+        return False, "Duplicate snapshot (already stored)"
+    ts = time.strftime("%Y%m%d_%H%M%S")
+    fname = f"{ts}_{h[:8]}.csv"
+    path = os.path.join(store_dir, fname)
+    try:
+        with open(path, "wb") as f:
+            f.write(b)
+        # record metadata
+        try:
+            tmp = pd.read_csv(io.BytesIO(b))
+            rows, cols = tmp.shape
+        except Exception:
+            rows, cols = None, None
+        new_row = {
+            "path": path, "bytes_hash": h, "source": source_label,
+            "rows": rows, "cols": cols, "added_at": time.strftime("%Y-%m-%d %H:%M:%S")
+        }
+        dfm = pd.concat([dfm, pd.DataFrame([new_row])], ignore_index=True)
+        save_manifest(dfm)
+        return True, path
+    except Exception as e:
+        return False, f"Save failed: {e}"
+
+def merge_store_csvs(limit: int) -> pd.DataFrame:
+    """Load up to `limit` most recent CSVs in store and concat."""
+    dfm = load_manifest()
+    if dfm.empty:
+        return pd.DataFrame()
+    # sort by added_at if present else by path
+    try:
+        dfm["_key"] = pd.to_datetime(dfm["added_at"], errors="coerce")
+        dfm.sort_values(by=["_key"], inplace=True)
+    except Exception:
+        dfm.sort_values(by=["path"], inplace=True)
+    paths = dfm["path"].dropna().tolist()
+    # keep last `limit`
+    paths = paths[-limit:]
+    frames = []
+    for p in paths:
+        try:
+            with open(p, "rb") as f:
+                frames.append(pd.read_csv(f))
+        except Exception:
+            continue
+    if not frames:
+        return pd.DataFrame()
+    return pd.concat(frames, ignore_index=True)
+
+col_store_a, col_store_b = st.sidebar.columns(2)
+with col_store_a:
+    if st.button("📄 View manifest", key="view_manifest_btn"):
+        st.session_state["_show_manifest"] = True
+with col_store_b:
+    if st.button("🧹 Clear store", key="clear_store_btn"):
+        if ensure_store():
+            # remove files + manifest
+            try:
+                for p in glob.glob(os.path.join(store_dir, "*.csv")):
+                    os.remove(p)
+                if os.path.exists(manifest_path()):
+                    os.remove(manifest_path())
+                st.sidebar.success("Store cleared.")
+            except Exception as e:
+                st.sidebar.error(f"Clear failed: {e}")
+
+if st.session_state.get("_show_manifest"):
+    st.subheader("Store Manifest")
+    st.dataframe(load_manifest(), use_container_width=True)
+
+# ================== Data sources (Main) ==================
 st.sidebar.header("Main Report — Data Source")
 source_type = st.sidebar.radio(
-    "Choose source",
-    ["Manual upload", "Public CSV URL", "Local folder (latest *.csv)"],
-    index=0,
-    key="main_source_radio"  # unique key
+    "Choose source", ["Manual upload", "Public CSV URL", "Local folder (latest *.csv)"],
+    index=0, key="main_source_radio"
 )
-main_url    = st.sidebar.text_input("Main CSV URL", os.getenv("MAIN_CSV_URL", ""))
-main_folder = st.sidebar.text_input("Main local folder", "./data")
-main_glob   = st.sidebar.text_input("Main filename pattern", "*.csv")
+main_url    = st.sidebar.text_input("Main CSV URL", os.getenv("MAIN_CSV_URL", ""), key="main_url")
+main_folder = st.sidebar.text_input("Main local folder", "./data", key="main_folder")
+main_glob   = st.sidebar.text_input("Main filename pattern", "*.csv", key="main_glob")
 
-df, source_meta = None, {}
+def try_fetch_csv_url(url: str) -> tuple[pd.DataFrame | None, dict, bytes | None]:
+    if not HAS_REQUESTS:
+        return None, {"error": "Package 'requests' not installed. Add it to requirements.txt"}, None
+    if not url:
+        return None, {"error": "No URL provided"}, None
+    try:
+        r = requests.get(url, timeout=45)
+        if r.status_code >= 300:
+            return None, {"error": f"{r.status_code}: {r.text[:300]}", "source": url}, None
+        df_ = read_any(r.content, name_hint=url)
+        return df_, {"source": url, "bytes": len(r.content)}, r.content
+    except Exception as e:
+        return None, {"error": str(e), "source": url}, None
+
+def load_latest_local_csv(folder: str, pattern: str = "*.csv") -> tuple[pd.DataFrame | None, dict, bytes | None]:
+    try:
+        paths = sorted(glob.glob(os.path.join(folder, pattern)), key=lambda p: os.path.getmtime(p))
+        if not paths: return None, {"error": f"No files matching {pattern} in {folder}"}, None
+        latest = paths[-1]
+        with open(latest, "rb") as f:
+            b = f.read()
+        df_ = read_any(io.BytesIO(b), name_hint=latest)
+        return df_, {"source": latest, "mtime": os.path.getmtime(latest)}, b
+    except Exception as e:
+        return None, {"error": str(e)}, None
+
+df, source_meta, raw_bytes = None, {}, None
 try:
     if source_type == "Public CSV URL":
-        df, source_meta = try_fetch_csv_url(main_url)
+        df, source_meta, raw_bytes = try_fetch_csv_url(main_url)
         if df is None: st.error(f"URL load failed: {source_meta.get('error','')}"); st.stop()
     elif source_type == "Local folder (latest *.csv)":
-        df, source_meta = load_latest_local_csv(main_folder, main_glob)
+        df, source_meta, raw_bytes = load_latest_local_csv(main_folder, main_glob)
         if df is None: st.error(f"Local load failed: {source_meta.get('error','')}"); st.stop()
     else:
         uploaded = st.file_uploader("Main report (CSV/XLSX/XLS)", type=["csv", "xlsx", "xls"], key="main_uploader")
         if uploaded is None:
             st.info("Upload the main CSV/Excel file, or choose another source in the sidebar.")
             st.stop()
-        df = read_any(uploaded); source_meta = {"source": "uploaded file"}
+        # keep a copy of bytes for store (if CSV; else snapshot via df.to_csv)
+        try:
+            raw_bytes = uploaded.getvalue()
+        except Exception:
+            raw_bytes = None
+        df = read_any(uploaded); source_meta = {"source": "uploaded file", "name": getattr(uploaded, "name", "")}
 except Exception as e:
-    st.error(f"Failed to load data: {e}")
-    st.stop()
+    st.error(f"Failed to load data: {e}"); st.stop()
 
 if df is None or df.empty:
     st.warning("The main report appears to be empty."); st.stop()
 
-# Normalize: "Abandoned (%rec)" -> "Abandon %"
+# Normalize abandoned column label
 for c in list(df.columns):
     if norm(c) == norm("Abandoned (%rec)"):
         df.rename(columns={c: "Abandon %"}, inplace=True)
@@ -360,14 +466,37 @@ st.caption(f"Loaded main report from: **{source_meta.get('source','(unknown)')}*
 st.subheader("Preview — Main Report (first 20 rows)")
 st.dataframe(df.head(20), use_container_width=True)
 
-# Column mapping
+# --------- Snapshot controls ----------
+col_snap_a, col_snap_b = st.columns([1,1])
+with col_snap_a:
+    if st.button("💾 Save snapshot to store", key="save_snapshot_btn"):
+        if persist_uploads:
+            # prefer raw_bytes if it's a CSV; else use df.to_csv
+            bytes_to_save = raw_bytes
+            # If raw_bytes unavailable or not CSVish, make a CSV snapshot
+            try:
+                # simple CSV sniff: if bytes start with %PDF or PK or XLS sig, we fallback to df.to_csv
+                if (bytes_to_save is None) or (bytes_to_save[:4] in [b"%PDF", b"PK\x03\x04"]):
+                    bytes_to_save = df.to_csv(index=False).encode("utf-8")
+            except Exception:
+                bytes_to_save = df.to_csv(index=False).encode("utf-8")
+            ok, msg = save_snapshot_bytes(bytes_to_save, source_label=source_meta.get("source","snapshot"))
+            if ok: st.success(f"Snapshot saved: {msg}")
+            else:  st.info(msg)
+        else:
+            st.info("Enable 'Persist uploaded/current dataset to store' in the sidebar.")
+with col_snap_b:
+    if st.button("🔁 Reload store manifest", key="reload_manifest_btn"):
+        st.session_state["_show_manifest"] = True
+
+# ================== Column mapping ==================
 st.subheader("Column Mapping — Main Report")
 SKILL_SYNS  = ["skill", "skill name", "skill group", "group", "queue", "split", "team", "program", "department", "dept", "category", "line of business", "lob"]
 CALLS_SYNS  = ["calls", "total calls", "calls offered", "offered", "inbound calls", "in calls", "total contacts", "contacts", "total interactions", "volume"]
-AGENTS_SYNS = ["agents staffed", "agents", "agent count", "staffed agents", "distinct agents", "distinct agent count", "unique agents", "logged in agents", "logged-in agents", "logged in", "agents (distinct)", "agents (unique)"]
-AHT_SYNS    = ["aht", "average handle time", "avg handle time", "avg handling time", "avg handle", "average handling time", "aht (s)", "aht (sec)", "talk+hold+acw", "handle time", "a.h.t", "avg hdl time", "avg handle-time"]
-ABAND_CNT_SYNS = ["abandoned count", "abandoned", "abandon count", "aband count", "abandoned calls", "aband qty", "aband num", "aband total"]
-ABAND_PCT_SYNS = ["abandon %", "abandoned (%rec)", "abandoned percent", "abandoned %", "abandonment rate", "abandon rate", "aband %", "aband pct", "abandonment %", "abandonment pct", "abn %", "abn pct"]
+AGENTS_SYNS = ["agents staffed", "agents", "agent count", "staffed agents", "distinct agents", "distinct agent count", "unique agents"]
+AHT_SYNS    = ["aht", "average handle time", "avg handle time", "avg handling time", "avg handle", "aht (s)", "aht (sec)", "talk+hold+acw"]
+ABAND_CNT_SYNS = ["abandoned count", "abandoned", "abandon count", "aband count", "abandoned calls"]
+ABAND_PCT_SYNS = ["abandon %", "abandoned (%rec)", "abandonment rate", "abandon rate"]
 DATE_SYNS   = ["date", "day", "datetime", "date/time", "interval start", "start time", "timestamp", "report date"]
 
 skill_guess     = find_col(df, SKILL_SYNS)
@@ -390,7 +519,7 @@ abandoned_count_col = st.selectbox("Abandoned (count) column (optional, used if 
 date_col = st.selectbox("Date/Time column (required for trends)", ["<none>"] + cols,
                         index=idx_or_default(["<none>"]+cols, date_guess if date_guess else "<none>"))
 
-# Skills list (Fortress → PM Connect)
+# Fortress → PM Connect rename in skills list
 default_skills = ["B2B Member Success", "B2B Success Activation", "B2B Success Info", "B2B Success Tech Support",
                   "MS Activation", "MS Info", "MS Loyalty", "MS Tech Support", "PM Connect"]
 skills_list = st.text_area("Skills of interest (one per line)", value="\n".join(default_skills))
@@ -400,23 +529,28 @@ for s in raw_skills:
     if s.lower() == "fortress": s = "PM Connect"
     if s not in skills_wanted: skills_wanted.append(s)
 
-# Second report for Agents total
-st.sidebar.header("Second Report (Agents total) — Data Source")
+# ================== Second report (Agents & Total Calls) ==================
+st.sidebar.header("Second Report (Agents & Total Calls) — Data Source")
 second_source_type = st.sidebar.radio(
-    "Choose source",
-    ["Manual upload", "Public CSV URL", "Local folder (latest *.csv)"],
-    index=0,
-    key="second_source_radio"  # unique key
+    "Choose source", ["Manual upload", "Public CSV URL", "Local folder (latest *.csv)"],
+    index=0, key="second_source_radio"
 )
+def try_fetch_csv_url_simple(url):
+    df_, meta, b = try_fetch_csv_url(url)
+    return df_, meta
+def load_latest_local_csv_simple(folder, pattern):
+    df_, meta, b = load_latest_local_csv(folder, pattern)
+    return df_, meta
+
 second_df, second_meta = None, {}
 try:
     if second_source_type == "Public CSV URL":
-        url2 = st.sidebar.text_input("2nd CSV URL", os.getenv("SECOND_CSV_URL", ""))
-        if url2: second_df, second_meta = try_fetch_csv_url(url2)
+        url2 = st.sidebar.text_input("2nd CSV URL", os.getenv("SECOND_CSV_URL", ""), key="url2")
+        if url2: second_df, second_meta = try_fetch_csv_url_simple(url2)
     elif second_source_type == "Local folder (latest *.csv)":
-        fold2 = st.sidebar.text_input("2nd local folder", "./data2")
-        pat2  = st.sidebar.text_input("2nd filename pattern", "*.csv")
-        second_df, second_meta = load_latest_local_csv(fold2, pat2)
+        fold2 = st.sidebar.text_input("2nd local folder", "./data2", key="fold2")
+        pat2  = st.sidebar.text_input("2nd filename pattern", "*.csv", key="pat2")
+        second_df, second_meta = load_latest_local_csv_simple(fold2, pat2)
     else:
         uploaded2 = st.file_uploader("Second report (CSV/XLSX/XLS) — overall totals / no skill filter (optional)",
                                      type=["csv", "xlsx", "xls"], key="second_uploader")
@@ -451,16 +585,26 @@ aband_count_col_final = None
 if rates is None and abandoned_count_col != "<none>" and abandoned_count_col in df.columns:
     aband_count_col_final = abandoned_count_col
 
+# --- Totals (defaults from main report) ---
 total_calls = int(calls_num.sum())
 total_agents = int(agents_num.sum())
+calls_label = "Total Calls (from main report)"
 agents_label = "Agents Staffed (sum of per-skill)"
+
+# --- Override from SECOND report when available ---
+CALLS_SYNS  = ["calls", "total calls", "calls offered", "offered", "inbound calls", "contacts", "total contacts", "volume"]
 if second_df is not None and not second_df.empty:
     AGENTS_SYNS_MINI = ["agents staffed", "agents", "agent count", "distinct", "unique"]
     agents2_guess = find_col(second_df, AGENTS_SYNS_MINI) or next((c for c in second_df.columns if "agent" in c.lower()), None)
     if agents2_guess:
-        agents2_num = pd.to_numeric(second_df[agents2_guess], errors="coerce").fillna(0)
-        total_agents = int(agents2_num.sum()); agents_label = "Agents Staffed (from 2nd report)"
+        total_agents = int(pd.to_numeric(second_df[agents2_guess], errors="coerce").fillna(0).sum())
+        agents_label = "Agents Staffed (from 2nd report)"
+    calls2_guess = find_col(second_df, CALLS_SYNS) or next((c for c in second_df.columns if "call" in c.lower() or "offered" in c.lower() or "contact" in c.lower()), None)
+    if calls2_guess:
+        total_calls = int(pd.to_numeric(second_df[calls2_guess], errors="coerce").fillna(0).sum())
+        calls_label = "Total Calls (from 2nd report)"
 
+# --- Abandon % total ---
 if aband_count_col_final and total_calls > 0:
     aband_num_total = pd.to_numeric(df[aband_count_col_final], errors="coerce").fillna(0).sum()
     total_abandon_pct = (aband_num_total / total_calls) * 100
@@ -477,11 +621,46 @@ by_skill_core = pd.DataFrame({
 })
 by_skill_core["Abandon %"] = (rates.round(2).astype(str) + "%") if rates is not None else "N/A"
 
+# ================== Store merge for Trends (NEW) ==================
+st.markdown("---")
+st.header("📦 Historical Dataset")
+dataset_scope = st.radio(
+    "Use which data for TREND charts?", 
+    ("Current file only", "Merged historical store", "Current + historical"),
+    index=1, key="dataset_scope_radio"
+)
+
+historical_df = pd.DataFrame()
+if dataset_scope != "Current file only":
+    historical_df = merge_store_csvs(limit=max_merge)
+    if historical_df.empty:
+        st.info("No historical files found in the store yet. Save a snapshot to start building history.")
+    else:
+        st.success(f"Merged historical files: {len(historical_df)} rows")
+        st.dataframe(historical_df.head(10), use_container_width=True)
+
+# Pick analysis_df for trends
+if dataset_scope == "Current file only":
+    analysis_df = df.copy()
+elif dataset_scope == "Merged historical store":
+    analysis_df = historical_df.copy() if not historical_df.empty else df.copy()
+else:  # Current + historical
+    if historical_df.empty:
+        analysis_df = df.copy()
+    else:
+        # Align columns for safe concat
+        common_cols = [c for c in df.columns if c in historical_df.columns]
+        if not common_cols:
+            st.warning("Historical files have a different schema. Using current file for trends.")
+            analysis_df = df.copy()
+        else:
+            analysis_df = pd.concat([historical_df[common_cols], df[common_cols]], ignore_index=True)
+
 # ================== Filled Report (Core) ==================
 md = io.StringIO()
 def writeln(s=""): md.write(s + "\n")
 writeln("## Autofilled Metrics (Core)\n")
-writeln(f"### 3. Total Calls\n**{total_calls}**\n")
+writeln(f"### 3. {calls_label}\n**{total_calls}**\n")
 writeln(f"### 4. {agents_label}\n**{total_agents}**\n")
 writeln("### 6. Abandon %")
 writeln(f"**{(str(round(total_abandon_pct, 2)) + '%') if total_abandon_pct is not None else 'N/A'}**\n")
@@ -533,218 +712,194 @@ st.download_button("⬇️ Download report (Markdown)", data=report_md.encode("u
 st.subheader("By-Skill Table — Core Fields")
 st.dataframe(by_skill_core, use_container_width=True)
 
-# ================== Skill Trends ==================
+# ================== Skill Trends (uses analysis_df) ==================
 st.markdown("---")
 st.header("📈 Skill Trends — AHT & Abandon % (Daily / Weekly / Monthly)")
 
 if date_col == "<none>":
     st.info("Pick a **Date/Time column** above to enable trend charts.")
 else:
-    df_time = df.copy()
-    df_time.loc[df_time[skill_col].astype(str).str.lower() == "fortress", skill_col] = "PM Connect"
-    df_time["_AHT_sec"] = df_time[aht_col].apply(parse_duration_to_seconds)
-    df_time = add_time_columns(df_time, date_col)
-    rate_series = rates
+    trend_df = analysis_df.copy()
+    # normalize skill rename if present
+    if skill_col in trend_df.columns:
+        trend_df[skill_col] = trend_df[skill_col].astype(str).str.strip()
+        trend_df.loc[trend_df[skill_col].str.lower() == "fortress", skill_col] = "PM Connect"
 
-    daily_all   = aggregate_by_period_all_skills(df_time, skill_col, calls_col, "_AHT_sec", rate_series, (aband_count_col_final or None), "_DATE")
-    weekly_all  = aggregate_by_period_all_skills(df_time, skill_col, calls_col, "_AHT_sec", rate_series, (aband_count_col_final or None), "_WEEK_START")
-    monthly_all = aggregate_by_period_all_skills(df_time, skill_col, calls_col, "_AHT_sec", rate_series, (aband_count_col_final or None), "_MONTH_START")
+    # prepare numeric series from the *current file* mapping names
+    # If columns are missing in historical, they'll be NaN and safely skipped in aggregates
+    trend_df["_AHT_sec"] = trend_df[aht_col].apply(parse_duration_to_seconds) if aht_col in trend_df.columns else np.nan
+    trend_df = add_time_columns(trend_df, date_col)
 
-    all_skills_sorted = sorted(df_time[skill_col].astype(str).unique())
-    skill_choice = st.selectbox("Single skill", all_skills_sorted,
-                                index=idx_or_default(all_skills_sorted, "PM Connect" if "PM Connect" in all_skills_sorted else all_skills_sorted[0]))
+    rate_series = None
+    if abandoned_pct_col != "<none>" and abandoned_pct_col in trend_df.columns:
+        rate_series = to_percent(trend_df[abandoned_pct_col])
+    aband_count_col_final_for_trend = abandoned_count_col if (abandoned_count_col != "<none>" and abandoned_count_col in trend_df.columns) else None
 
-    def filter_skill(df_in, skill):
-        return df_in[df_in["Skill"].astype(str).str.lower() == skill.lower()].copy()
+    daily_all   = aggregate_by_period_all_skills(trend_df, skill_col, calls_col, "_AHT_sec", rate_series, aband_count_col_final_for_trend, "_DATE")
+    weekly_all  = aggregate_by_period_all_skills(trend_df, skill_col, calls_col, "_AHT_sec", rate_series, aband_count_col_final_for_trend, "_WEEK_START")
+    monthly_all = aggregate_by_period_all_skills(trend_df, skill_col, calls_col, "_AHT_sec", rate_series, aband_count_col_final_for_trend, "_MONTH_START")
 
-    daily   = filter_skill(daily_all,   skill_choice)
-    weekly  = filter_skill(weekly_all,  skill_choice)
-    monthly = filter_skill(monthly_all, skill_choice)
-
-    def delta_str(series):
-        if len(series) < 2 or pd.isna(series.iloc[-2]) or pd.isna(series.iloc[-1]): return "—"
-        diff = series.iloc[-1] - series.iloc[-2]
-        sign = "▲" if diff > 0 else ("▼" if diff < 0 else "—")
-        return f"{sign} {diff:.2f}"
-
-    k1, k2, k3, k4 = st.columns(4)
-    with k1:
-        st.metric("Last AHT (Daily)", daily["AHT"].iloc[-1] if not daily.empty else "N/A",
-                  delta=delta_str(daily["AHT_sec"]) if not daily.empty else "—")
-    with k2:
-        st.metric("Last Abandon % (Daily)", f"{daily['Abandon %'].iloc[-1]:.2f}%" if (not daily.empty and pd.notna(daily['Abandon %'].iloc[-1])) else "N/A",
-                  delta=delta_str(daily["Abandon %"]) if not daily.empty else "—")
-    with k3:
-        st.metric("Last AHT (Weekly)", weekly["AHT"].iloc[-1] if not weekly.empty else "N/A",
-                  delta=delta_str(weekly["AHT_sec"]) if not weekly.empty else "—")
-    with k4:
-        st.metric("Last Abandon % (Weekly)", f"{weekly['Abandon %'].iloc[-1]:.2f}%" if (not weekly.empty and pd.notna(weekly['Abandon %'].iloc[-1])) else "N/A",
-                  delta=delta_str(weekly["Abandon %"]) if not weekly.empty else "—")
-
-    def alt_line_chart(df_in: pd.DataFrame, y_col: str, y_title: str):
-        chart = (
-            alt.Chart(df_in)
-            .mark_line(point=True)
-            .encode(
-                x=alt.X("period:T", title="Period"),
-                y=alt.Y(f"{y_col}:Q", title=y_title),
-                tooltip=[
-                    alt.Tooltip("period:T", title="Period"),
-                    alt.Tooltip("Calls:Q", title="Calls", format=",.0f"),
-                    alt.Tooltip("AHT:N", title="AHT"),
-                    alt.Tooltip("Abandon %:Q", title="Abandon %", format=".2f")
-                ]
-            )
-            .properties(height=280, width="container")
-        )
-        st.altair_chart(chart, use_container_width=True)
-
-    def st_line_chart(df_in: pd.DataFrame, y_col: str, y_title: str):
-        if df_in.empty:
-            st.info("No data available."); return
-        st.write(y_title)
-        t = df_in[["period", y_col]].set_index("period")
-        st.line_chart(t)
-
-    def line_chart(df_in: pd.DataFrame, y_col: str, y_title: str):
-        if df_in.empty: st.info("No data available."); return
-        if HAS_ALTAIR: alt_line_chart(df_in, y_col, y_title)
-        else:          st_line_chart(df_in, y_col, y_title)
-
-    st.subheader(f"Daily — {skill_choice}")
-    c1, c2 = st.columns(2)
-    with c1:
-        t = daily.copy(); t["AHT_numeric"] = t["AHT_sec"]
-        line_chart(t.rename(columns={"AHT_numeric": "AHT_sec"}), "AHT_sec", "AHT (seconds)")
-    with c2:
-        line_chart(daily, "Abandon %", "Abandon %")
-    st.dataframe(daily.assign(**{"Abandon %": daily["Abandon %"].round(2)}), use_container_width=True)
-
-    st.subheader(f"Weekly — {skill_choice}")
-    c3, c4 = st.columns(2)
-    with c3:
-        t = weekly.copy(); t["AHT_numeric"] = t["AHT_sec"]
-        line_chart(t.rename(columns={"AHT_numeric": "AHT_sec"}), "AHT_sec", "AHT (seconds)")
-    with c4:
-        line_chart(weekly, "Abandon %", "Abandon %")
-    st.dataframe(weekly.assign(**{"Abandon %": weekly["Abandon %"].round(2)}), use_container_width=True)
-
-    st.subheader(f"Monthly — {skill_choice}")
-    c5, c6 = st.columns(2)
-    with c5:
-        t = monthly.copy(); t["AHT_numeric"] = t["AHT_sec"]
-        line_chart(t.rename(columns={"AHT_numeric": "AHT_sec"}), "AHT_sec", "AHT (seconds)")
-    with c6:
-        line_chart(monthly, "Abandon %", "Abandon %")
-    st.dataframe(monthly.assign(**{"Abandon %": monthly["Abandon %"].round(2)}), use_container_width=True)
-
-    # Downloads — single skill
-    def build_excel_bytes_safe(sheets):
-        try: return build_excel_bytes(sheets)
-        except Exception as e:
-            st.warning(f"Excel export unavailable: {e}")
-            return None
-
-    single_sheets = {
-        "Daily":   daily.assign(**{"Abandon %": daily["Abandon %"].round(2)}),
-        "Weekly":  weekly.assign(**{"Abandon %": weekly["Abandon %"].round(2)}),
-        "Monthly": monthly.assign(**{"Abandon %": monthly["Abandon %"].round(2)}),
-    }
-    xbytes = build_excel_bytes_safe(single_sheets)
-    if xbytes:
-        st.download_button("⬇️ Download single-skill trends (Excel)", data=xbytes,
-                           file_name=f"{norm(skill_choice)}_trends.xlsx",
-                           mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
-    st.download_button("⬇️ Download single-skill Daily (CSV)", data=single_sheets["Daily"].to_csv(index=False).encode("utf-8"),
-                       file_name=f"{norm(skill_choice)}_daily.csv", mime="text/csv")
-
-    # ---------- Multi-skill compare ----------
-    st.markdown("---")
-    st.header("🔀 Multi-skill Compare (overlay)")
-
-    all_skills_sorted = sorted(daily_all["Skill"].unique().tolist())
-    default_preselect = [s for s in ["PM Connect"] if s in all_skills_sorted] or all_skills_sorted[:3]
-    multi = st.multiselect("Select skills to compare", all_skills_sorted, default=default_preselect)
-
-    def overlay_alt(df_in: pd.DataFrame, y_col: str, title: str):
-        chart = (
-            alt.Chart(df_in)
-            .mark_line(point=True)
-            .encode(
-                x=alt.X("period:T", title="Period"),
-                y=alt.Y(f"{y_col}:Q", title=title),
-                color=alt.Color("Skill:N", legend=alt.Legend(title="Skill")),
-                tooltip=[
-                    alt.Tooltip("Skill:N"),
-                    alt.Tooltip("period:T", title="Period"),
-                    alt.Tooltip("Calls:Q", format=",.0f"),
-                    alt.Tooltip("AHT:N"),
-                    alt.Tooltip("Abandon %:Q", format=".2f")
-                ]
-            )
-            .properties(height=320, width="container")
-        )
-        st.altair_chart(chart, use_container_width=True)
-
-    def overlay_st(df_in: pd.DataFrame, y_col: str, title: str):
-        st.write(title)
-        if df_in.empty: st.info("No data for the selected skills."); return
-        p = df_in.pivot_table(index="period", columns="Skill", values=y_col, aggfunc="mean")
-        st.line_chart(p)
-
-    def overlay_chart(df_in: pd.DataFrame, y_col: str, title: str):
-        if df_in.empty: st.info("No data for the selected skills."); return
-        if HAS_ALTAIR: overlay_alt(df_in, y_col, title)
-        else:          overlay_st(df_in, y_col, title)
-
-    if multi:
-        d_daily   = daily_all[daily_all["Skill"].isin(multi)].copy()
-        d_weekly  = weekly_all[weekly_all["Skill"].isin(multi)].copy()
-        d_monthly = monthly_all[monthly_all["Skill"].isin(multi)].copy()
-
-        st.subheader("Daily compare")
-        oc1, oc2 = st.columns(2)
-        with oc1:
-            t = d_daily.copy(); t["AHT_numeric"] = t["AHT_sec"]
-            overlay_chart(t.rename(columns={"AHT_numeric":"AHT_sec"}), "AHT_sec", "AHT (seconds)")
-        with oc2:
-            overlay_chart(d_daily, "Abandon %", "Abandon %")
-        st.dataframe(d_daily.assign(**{"Abandon %": d_daily["Abandon %"].round(2)}), use_container_width=True)
-
-        st.subheader("Weekly compare")
-        oc3, oc4 = st.columns(2)
-        with oc3:
-            t = d_weekly.copy(); t["AHT_numeric"] = t["AHT_sec"]
-            overlay_chart(t.rename(columns={"AHT_numeric":"AHT_sec"}), "AHT_sec", "AHT (seconds)")
-        with oc4:
-            overlay_chart(d_weekly, "Abandon %", "Abandon %")
-        st.dataframe(d_weekly.assign(**{"Abandon %": d_weekly["Abandon %"].round(2)}), use_container_width=True)
-
-        st.subheader("Monthly compare")
-        oc5, oc6 = st.columns(2)
-        with oc5:
-            t = d_monthly.copy(); t["AHT_numeric"] = t["AHT_sec"]
-            overlay_chart(t.rename(columns={"AHT_numeric":"AHT_sec"}), "AHT_sec", "AHT (seconds)")
-        with oc6:
-            overlay_chart(d_monthly, "Abandon %", "Abandon %")
-        st.dataframe(d_monthly.assign(**{"Abandon %": d_monthly["Abandon %"].round(2)}), use_container_width=True)
-
-        compare_sheets = {
-            "Daily":   d_daily.assign(**{"Abandon %": d_daily["Abandon %"].round(2)}),
-            "Weekly":  d_weekly.assign(**{"Abandon %": d_weekly["Abandon %"].round(2)}),
-            "Monthly": d_monthly.assign(**{"Abandon %": d_monthly["Abandon %"].round(2)}),
-        }
-        try:
-            xb = build_excel_bytes(compare_sheets)
-            st.download_button("⬇️ Download compare trends (Excel)", data=xb,
-                               file_name=f"compare_trends_{len(multi)}_skills.xlsx",
-                               mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
-        except Exception as e:
-            st.warning(f"Compare Excel export unavailable: {e}")
-        st.download_button("⬇️ Download compare Daily (CSV)", data=compare_sheets["Daily"].to_csv(index=False).encode("utf-8"),
-                           file_name=f"compare_daily.csv", mime="text/csv")
+    all_skills_sorted = sorted([str(x) for x in trend_df[skill_col].dropna().unique()]) if skill_col in trend_df.columns else []
+    if not all_skills_sorted:
+        st.info("No skill data found to plot. Check your column mapping and historical files.")
     else:
-        st.info("Select 1+ skills above to see overlay charts.")
+        skill_choice = st.selectbox("Single skill", all_skills_sorted,
+                                    index=idx_or_default(all_skills_sorted, "PM Connect" if "PM Connect" in all_skills_sorted else all_skills_sorted[0]),
+                                    key="single_skill_select")
+
+        def filter_skill(df_in, skill):
+            return df_in[df_in["Skill"].astype(str).str.lower() == skill.lower()].copy()
+
+        daily   = filter_skill(daily_all,   skill_choice)
+        weekly  = filter_skill(weekly_all,  skill_choice)
+        monthly = filter_skill(monthly_all, skill_choice)
+
+        def delta_str(series):
+            if len(series) < 2 or pd.isna(series.iloc[-2]) or pd.isna(series.iloc[-1]): return "—"
+            diff = series.iloc[-1] - series.iloc[-2]
+            sign = "▲" if diff > 0 else ("▼" if diff < 0 else "—")
+            return f"{sign} {diff:.2f}"
+
+        k1, k2, k3, k4 = st.columns(4)
+        with k1:
+            st.metric("Last AHT (Daily)", daily["AHT"].iloc[-1] if not daily.empty else "N/A",
+                      delta=delta_str(daily["AHT_sec"]) if not daily.empty else "—")
+        with k2:
+            st.metric("Last Abandon % (Daily)", f"{daily['Abandon %'].iloc[-1]:.2f}%" if (not daily.empty and pd.notna(daily['Abandon %'].iloc[-1])) else "N/A",
+                      delta=delta_str(daily["Abandon %"]) if not daily.empty else "—")
+        with k3:
+            st.metric("Last AHT (Weekly)", weekly["AHT"].iloc[-1] if not weekly.empty else "N/A",
+                      delta=delta_str(weekly["AHT_sec"]) if not weekly.empty else "—")
+        with k4:
+            st.metric("Last Abandon % (Weekly)", f"{weekly['Abandon %'].iloc[-1]:.2f}%" if (not weekly.empty and pd.notna(weekly['Abandon %'].iloc[-1])) else "N/A",
+                      delta=delta_str(weekly["Abandon %"]) if not weekly.empty else "—")
+
+        def alt_line_chart(df_in: pd.DataFrame, y_col: str, y_title: str):
+            chart = (
+                alt.Chart(df_in)
+                .mark_line(point=True)
+                .encode(
+                    x=alt.X("period:T", title="Period"),
+                    y=alt.Y(f"{y_col}:Q", title=y_title),
+                    tooltip=[
+                        alt.Tooltip("period:T", title="Period"),
+                        alt.Tooltip("Calls:Q", title="Calls", format=",.0f"),
+                        alt.Tooltip("AHT:N", title="AHT"),
+                        alt.Tooltip("Abandon %:Q", title="Abandon %", format=".2f")
+                    ]
+                )
+                .properties(height=280, width="container")
+            )
+            st.altair_chart(chart, use_container_width=True)
+
+        def st_line_chart(df_in: pd.DataFrame, y_col: str, y_title: str):
+            if df_in.empty: st.info("No data available."); return
+            st.write(y_title)
+            t = df_in[["period", y_col]].set_index("period")
+            st.line_chart(t)
+
+        def line_chart(df_in: pd.DataFrame, y_col: str, y_title: str):
+            if df_in.empty: st.info("No data available."); return
+            if HAS_ALTAIR: alt_line_chart(df_in, y_col, y_title)
+            else:          st_line_chart(df_in, y_col, y_title)
+
+        st.subheader(f"Daily — {skill_choice}")
+        c1, c2 = st.columns(2)
+        with c1:
+            t = daily.copy(); t["AHT_numeric"] = t["AHT_sec"]
+            line_chart(t.rename(columns={"AHT_numeric": "AHT_sec"}), "AHT_sec", "AHT (seconds)")
+        with c2:
+            line_chart(daily, "Abandon %", "Abandon %")
+        st.dataframe(daily.assign(**{"Abandon %": daily["Abandon %"].round(2)}), use_container_width=True)
+
+        st.subheader(f"Weekly — {skill_choice}")
+        c3, c4 = st.columns(2)
+        with c3:
+            t = weekly.copy(); t["AHT_numeric"] = t["AHT_sec"]
+            line_chart(t.rename(columns={"AHT_numeric": "AHT_sec"}), "AHT_sec", "AHT (seconds)")
+        with c4:
+            line_chart(weekly, "Abandon %", "Abandon %")
+        st.dataframe(weekly.assign(**{"Abandon %": weekly["Abandon %"].round(2)}), use_container_width=True)
+
+        st.subheader(f"Monthly — {skill_choice}")
+        c5, c6 = st.columns(2)
+        with c5:
+            t = monthly.copy(); t["AHT_numeric"] = t["AHT_sec"]
+            line_chart(t.rename(columns={"AHT_numeric": "AHT_sec"}), "AHT_sec", "AHT (seconds)")
+        with c6:
+            line_chart(monthly, "Abandon %", "Abandon %")
+        st.dataframe(monthly.assign(**{"Abandon %": monthly["Abandon %"].round(2)}), use_container_width=True)
+
+        # ---------- Multi-skill compare ----------
+        st.markdown("---")
+        st.header("🔀 Multi-skill Compare (overlay)")
+
+        all_skills_sorted2 = sorted(daily_all["Skill"].unique().tolist())
+        default_preselect = [s for s in ["PM Connect"] if s in all_skills_sorted2] or all_skills_sorted2[:3]
+        multi = st.multiselect("Select skills to compare", all_skills_sorted2, default=default_preselect, key="multi_skills_select")
+
+        def overlay_alt(df_in: pd.DataFrame, y_col: str, title: str):
+            chart = (
+                alt.Chart(df_in)
+                .mark_line(point=True)
+                .encode(
+                    x=alt.X("period:T", title="Period"),
+                    y=alt.Y(f"{y_col}:Q", title=title),
+                    color=alt.Color("Skill:N", legend=alt.Legend(title="Skill")),
+                    tooltip=[
+                        alt.Tooltip("Skill:N"),
+                        alt.Tooltip("period:T", title="Period"),
+                        alt.Tooltip("Calls:Q", format=",.0f"),
+                        alt.Tooltip("AHT:N"),
+                        alt.Tooltip("Abandon %:Q", format=".2f")
+                    ]
+                )
+                .properties(height=320, width="container")
+            )
+            st.altair_chart(chart, use_container_width=True)
+
+        def overlay_st(df_in: pd.DataFrame, y_col: str, title: str):
+            st.write(title)
+            if df_in.empty: st.info("No data for the selected skills."); return
+            p = df_in.pivot_table(index="period", columns="Skill", values=y_col, aggfunc="mean")
+            st.line_chart(p)
+
+        def overlay_chart(df_in: pd.DataFrame, y_col: str, title: str):
+            if df_in.empty: st.info("No data for the selected skills."); return
+            if HAS_ALTAIR: overlay_alt(df_in, y_col, title)
+            else:          overlay_st(df_in, y_col, title)
+
+        if multi:
+            d_daily   = daily_all[daily_all["Skill"].isin(multi)].copy()
+            d_weekly  = weekly_all[weekly_all["Skill"].isin(multi)].copy()
+            d_monthly = monthly_all[monthly_all["Skill"].isin(multi)].copy()
+
+            st.subheader("Daily compare")
+            oc1, oc2 = st.columns(2)
+            with oc1:
+                t = d_daily.copy(); t["AHT_numeric"] = t["AHT_sec"]
+                overlay_chart(t.rename(columns={"AHT_numeric":"AHT_sec"}), "AHT_sec", "AHT (seconds)")
+            with oc2:
+                overlay_chart(d_daily, "Abandon %", "Abandon %")
+            st.dataframe(d_daily.assign(**{"Abandon %": d_daily["Abandon %"].round(2)}), use_container_width=True)
+
+            st.subheader("Weekly compare")
+            oc3, oc4 = st.columns(2)
+            with oc3:
+                t = d_weekly.copy(); t["AHT_numeric"] = t["AHT_sec"]
+                overlay_chart(t.rename(columns={"AHT_numeric":"AHT_sec"}), "AHT_sec", "AHT (seconds)")
+            with oc4:
+                overlay_chart(d_weekly, "Abandon %", "Abandon %")
+            st.dataframe(d_weekly.assign(**{"Abandon %": d_weekly["Abandon %"].round(2)}), use_container_width=True)
+
+            st.subheader("Monthly compare")
+            oc5, oc6 = st.columns(2)
+            with oc5:
+                t = d_monthly.copy(); t["AHT_numeric"] = t["AHT_sec"]
+                overlay_chart(t.rename(columns={"AHT_numeric":"AHT_sec"}), "AHT_sec", "AHT (seconds)")
+            with oc6:
+                overlay_chart(d_monthly, "Abandon %", "Abandon %")
+            st.dataframe(d_monthly.assign(**{"Abandon %": d_monthly["Abandon %"].round(2)}), use_container_width=True)
 
 # ================== Optional Word/PDF exports ==================
 try:
@@ -763,6 +918,8 @@ try:
 except Exception as e:
     st.info(f"Word export disabled: {e}")
 
+# Preferred PDF via ReportLab; fallback to fpdf2 if installed
+pdf_ready = False
 try:
     from reportlab.lib.pagesizes import letter
     from reportlab.pdfgen import canvas
@@ -778,7 +935,20 @@ try:
                 for w in _tw.wrap(line, width=95): c.drawString(L, y, w); y -= 0.18*inch
             if y < B: c.showPage(); y = height - T; c.setFont("Times-Roman", 11)
         c.showPage(); c.save(); bio.seek(0); return bio.getvalue()
+    pdf_ready = True
+except Exception:
+    try:
+        from fpdf import FPDF
+        def build_pdf(md_text):
+            pdf = FPDF(); pdf.set_auto_page_break(auto=True, margin=15); pdf.add_page()
+            pdf.set_font("Helvetica", size=11)
+            for line in md_text.splitlines():
+                pdf.multi_cell(0, 6, line if line.strip() else " ")
+            return pdf.output(dest="S").encode("latin1")
+        pdf_ready = True
+    except Exception as e:
+        st.info(f"PDF export disabled: {e}")
+
+if pdf_ready:
     st.download_button("⬇️ Download core report (PDF)", data=build_pdf(report_md),
                        file_name="filled_report_core.pdf", mime="application/pdf")
-except Exception as e:
-    st.info(f"PDF export disabled: {e}")
