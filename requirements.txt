@@ -2,8 +2,15 @@ streamlit==1.36.0
 pandas==2.2.2
 numpy==1.26.4
 altair==5.2.0
-openpyxl==3.1.5
-xlrd==2.0.1
+
+# File I/O (CSV/Excel)
+openpyxl==3.1.5      # write/read .xlsx
+xlrd==2.0.1          # read legacy .xls (optional, but supported in the app)
+
+# Fetching files/logos by URL
 requests==2.32.3
-python-docx==1.1.2
-reportlab==4.2.2
+
+# Exports
+python-docx==1.1.2   # Word export
+reportlab==4.2.2     # PDF export (preferred)
+fpdf2==2.7.9         # PDF fallback if ReportLab isn’t available
